@@ -801,7 +801,12 @@ class ConfigView(discord.ui.View):
 # --------------------------------------------------------------------------
 
 class Tracking(commands.Cog, name="Invite Tracker"):
-    """Complete invite tracking system with an interactive setup panel."""
+    """Complete invite tracking system with an interactive setup panel.
+
+    This cog contains the actual working logic (database, listeners, commands).
+    The help-menu display (help_custom + the `InviteTracker` group) lives in a
+    separate cog file (invite_tracker_menu.py) and is loaded independently.
+    """
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
