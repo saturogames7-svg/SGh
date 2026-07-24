@@ -1,237 +1,137 @@
 import discord
+from utils.emoji import TICK
 from discord.ext import commands
-from discord import app_commands
 import aiosqlite
+import asyncio
+from datetime import timedelta
+import re
 
-
-DATABASE = "db/invites.db"
-
-
-class InviteTracker(commands.Cog):
-
+class AntiInvite(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.invites = {}
+        self.invite_pattern = re.compile(r'(https?://)?(www\.)?(discord\.gg|discordapp\.com/invite|discord\.com/invite)/\S+')
 
-    async def cog_load(self):
-        async with aiosqlite.connect(DATABASE) as db:
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS invite_config(
-                guild_id INTEGER PRIMARY KEY,
-                channel_id INTEGER,
-                message TEXT
-            )
-            """)
+    async def is_automod_enabled(self, guild_id):
+        async with aiosqlite.connect("db/automod.db") as db:
+            cursor = await db.execute("SELECT enabled FROM automod WHERE guild_id = ?", (guild_id,))
+            result = await cursor.fetchone()
+            return result is not None and result[0] == 1
 
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS invite_users(
-                guild_id INTEGER,
-                user_id INTEGER,
-                invites INTEGER DEFAULT 0,
-                PRIMARY KEY(guild_id,user_id)
-            )
-            """)
+    async def is_anti_invites_enabled(self, guild_id):
+        async with aiosqlite.connect("db/automod.db") as db:
+            cursor = await db.execute("SELECT punishment FROM automod_punishments WHERE guild_id = ? AND event = 'Anti invites'", (guild_id,))
+            result = await cursor.fetchone()
+            return result is not None
 
-            await db.commit()
+    async def get_ignored_channels(self, guild_id):
+        async with aiosqlite.connect("db/automod.db") as db:
+            cursor = await db.execute("SELECT id FROM automod_ignored WHERE guild_id = ? AND type = 'channel'", (guild_id,))
+            return [row[0] for row in await cursor.fetchall()]
 
+    async def get_ignored_roles(self, guild_id):
+        async with aiosqlite.connect("db/automod.db") as db:
+            cursor = await db.execute("SELECT id FROM automod_ignored WHERE guild_id = ? AND type = 'role'", (guild_id,))
+            return [row[0] for row in await cursor.fetchall()]
 
-    async def cache_invites(self,guild):
+    async def get_punishment(self, guild_id):
+        async with aiosqlite.connect("db/automod.db") as db:
+            cursor = await db.execute("SELECT punishment FROM automod_punishments WHERE guild_id = ? AND event = 'Anti invites'", (guild_id,))
+            result = await cursor.fetchone()
+            return result[0] if result else None
 
-        invites = await guild.invites()
+    async def log_action(self, guild, user, channel, action, reason):
+        async with aiosqlite.connect("db/automod.db") as db:
+            cursor = await db.execute("SELECT log_channel FROM automod_logging WHERE guild_id = ?", (guild.id,))
+            log_channel_id = await cursor.fetchone()
 
-        self.invites[guild.id] = {
-            invite.code: invite.uses
-            for invite in invites
-        }
-
+        if log_channel_id and log_channel_id[0]:
+            log_channel = guild.get_channel(log_channel_id[0])
+            if log_channel:
+                embed = discord.Embed(title="Automod Log: Anti-Invite", color=0xFF0000)
+                embed.add_field(name="User", value=user.mention, inline=False)
+                embed.add_field(name="Action", value=action, inline=False)
+                embed.add_field(name="Channel", value=channel.mention, inline=False)
+                embed.add_field(name="Reason", value=reason, inline=False)
+                embed.set_footer(text=f"User ID: {user.id}")
+                avatar_url = user.avatar.url if user.avatar else user.default_avatar.url
+                embed.set_thumbnail(url=avatar_url)
+                embed.timestamp=discord.utils.utcnow()
+                await log_channel.send(embed=embed)
 
     @commands.Cog.listener()
-    async def on_ready(self):
+    async def on_message(self, message):
+        if message.author.bot:
+            return
 
-        for guild in self.bot.guilds:
+        guild = message.guild
+        user = message.author
+        channel = message.channel
+        guild_id = guild.id
+
+        if not await self.is_automod_enabled(guild_id) or not await self.is_anti_invites_enabled(guild_id):
+            return
+
+        if user == guild.owner or user == self.bot.user:
+            return
+
+        ignored_channels = await self.get_ignored_channels(guild_id)
+        if channel.id in ignored_channels:
+            return
+
+        ignored_roles = await self.get_ignored_roles(guild_id)
+        if any(role.id in ignored_roles for role in user.roles):
+            return
+
+        if self.invite_pattern.search(message.content):
+            invite_link = self.invite_pattern.search(message.content).group(0)
+            invite_code = invite_link.split('/')[-1]
+
             try:
-                await self.cache_invites(guild)
-            except:
+                invite = await guild.invites()
+                if any(invite.code == invite_code for invite in invite):
+                    return  
+
+                punishment = await self.get_punishment(guild_id)
+                action_taken = None
+                reason = "Posted an invite link"
+
+                try:
+                    if punishment == "Mute":
+                        timeout_duration = discord.utils.utcnow() + timedelta(minutes=12)
+                        await user.edit(timed_out_until=timeout_duration, reason="Posted an invite link")
+                        action_taken = "Muted for 12 minutes"
+                    elif punishment == "Kick":
+                        await user.kick(reason="Posted an invite link")
+                        action_taken = "Kicked"
+                    elif punishment == "Ban":
+                        await user.ban(reason="Posted an invite link")
+                        action_taken = "Banned"
+                        
+                    await message.delete()
+
+                    simple_embed = discord.Embed(title="Automod Anti-Invite", color=0xFF0000)
+                    simple_embed.description = f"{TICK} | {user.mention} has been successfully **{action_taken}** for **posting an invite link.**"
+                    
+                    simple_embed.set_footer(text="Use the “automod logging” command to get automod logs if it is not enabled.", icon_url=self.bot.user.avatar.url)
+                    await channel.send(embed=simple_embed, delete_after=30)
+
+                    await self.log_action(guild, user, channel, action_taken, reason)
+
+                except discord.Forbidden:
+                    pass
+                except discord.HTTPException:
+                    pass
+                except Exception:
+                    pass
+
+            except discord.Forbidden:
+                pass
+            except discord.HTTPException:
+                pass
+            except Exception:
                 pass
 
-
     @commands.Cog.listener()
-    async def on_member_join(self,member):
+    async def on_rate_limit(self, message):
+        await asyncio.sleep(10)
 
-        guild = member.guild
-
-        before = self.invites.get(guild.id,{})
-
-        try:
-            invites = await guild.invites()
-        except:
-            return
-
-
-        used_invite = None
-
-
-        for invite in invites:
-
-            old = before.get(invite.code,0)
-
-            if invite.uses > old:
-                used_invite = invite
-                break
-
-
-        await self.cache_invites(guild)
-
-
-        if not used_invite:
-            return
-
-
-        inviter = used_invite.inviter
-
-
-        async with aiosqlite.connect(DATABASE) as db:
-
-            await db.execute("""
-            INSERT INTO invite_users
-            VALUES(?,?,1)
-            ON CONFLICT(guild_id,user_id)
-            DO UPDATE SET invites = invites + 1
-            """,
-            (
-                guild.id,
-                inviter.id
-            ))
-
-            await db.commit()
-
-
-
-            cursor = await db.execute(
-                """
-                SELECT invites 
-                FROM invite_users
-                WHERE guild_id=? AND user_id=?
-                """,
-                (
-                    guild.id,
-                    inviter.id
-                )
-            )
-
-            total = await cursor.fetchone()
-
-
-        async with aiosqlite.connect(DATABASE) as db:
-
-            cursor = await db.execute(
-            """
-            SELECT channel_id,message
-            FROM invite_config
-            WHERE guild_id=?
-            """,
-            (guild.id,)
-            )
-
-            config = await cursor.fetchone()
-
-
-        if not config:
-            return
-
-
-        channel = guild.get_channel(config[0])
-
-
-        if not channel:
-            return
-
-
-
-        embed = discord.Embed(
-            title="🎉 New Invite!",
-            color=0x00FF00
-        )
-
-        embed.add_field(
-            name="Member Joined",
-            value=member.mention,
-            inline=False
-        )
-
-        embed.add_field(
-            name="Invited By",
-            value=inviter.mention,
-            inline=False
-        )
-
-        embed.add_field(
-            name="Total Invites",
-            value=f"**{total[0]}**",
-            inline=False
-        )
-
-
-        await channel.send(
-            content=config[1].replace(
-                "{user}",
-                inviter.mention
-            ).replace(
-                "{member}",
-                member.mention
-            ),
-            embed=embed
-        )
-
-
-
-    @app_commands.command(
-        name="invite_setup",
-        description="Setup invite tracker"
-    )
-    @app_commands.checks.has_permissions(
-        administrator=True
-    )
-    async def invite_setup(
-        self,
-        interaction:discord.Interaction,
-        channel:discord.TextChannel,
-        message:str
-    ):
-
-
-        async with aiosqlite.connect(DATABASE) as db:
-
-            await db.execute(
-            """
-            INSERT INTO invite_config
-            VALUES(?,?,?)
-            ON CONFLICT(guild_id)
-            DO UPDATE SET
-            channel_id=?,
-            message=?
-            """,
-            (
-                interaction.guild.id,
-                channel.id,
-                message,
-                channel.id,
-                message
-            ))
-
-            await db.commit()
-
-
-
-        await interaction.response.send_message(
-            "✅ Invite Tracker has been configured.",
-            ephemeral=True
-        )
-
-
-
-async def setup(bot):
-
-    await bot.add_cog(
-        InviteTracker(bot)
-    )
