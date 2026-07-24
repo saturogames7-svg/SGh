@@ -406,28 +406,39 @@ class Customrole(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-
-        if message.author.bot or not message.content:
+    
+        # Ignore bots
+        if message.author.bot:
             return
-
+    
+        # Ignore DMs
+        if message.guild is None:
+            return
+    
+        # Ignore empty messages
+        if not message.content:
+            return
+    
         prefixes = await self.bot.get_prefix(message)
-
-        
-        if not prefixes:
-            return
-
-        
-        if not any(message.content.startswith(prefix) for prefix in prefixes):
-            return
-
-        
+    
+        if isinstance(prefixes, str):
+            prefixes = [prefixes]
+    
+        command_name = None
+    
         for prefix in prefixes:
             if message.content.startswith(prefix):
-                command_name = message.content[len(prefix):].split() 
+                parts = message.content[len(prefix):].strip().split()
+    
+                if not parts:
+                    return
+    
+                command_name = parts[0]
                 break
-        else:
+    
+        if command_name is None:
             return
-
+    
         guild_id = message.guild.id
 
         
