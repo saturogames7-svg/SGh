@@ -81,53 +81,120 @@ def make_verify_callback(role_id: int):
     async def callback(interaction: discord.Interaction):
         try:
             guild = interaction.guild
-            role = guild.get_role(role_id)
-            if not role:
-                await interaction.response.send_message(
-                    "Role not found anymore, contact an admin.", ephemeral=True
-                )
-                return
 
-            member = interaction.user
-            if role in member.roles:
-                embed = discord.Embed(
-                    title="Already Verified",
-                    description=f"You already have the **{role.name}** role.",
-                    color=DEFAULT_COLOR
-                )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-                return
-
-            if (not guild.me.guild_permissions.manage_roles
-                    or guild.me.top_role.position <= role.position):
+            if guild is None:
                 await interaction.response.send_message(
-                    "I don't have permission to give this role (check role hierarchy).",
+                    "This button can only be used inside a server.",
                     ephemeral=True
                 )
                 return
 
-            await member.add_roles(role, reason="Verification button")
-            await log_verification(guild.id, member.id, role.id)
+            role = guild.get_role(role_id)
 
-            embed = discord.Embed(
-                title="Verified",
-                description=f"You've been given the **{role.name}** role. Welcome!",
-                color=DEFAULT_COLOR,
-                timestamp=utc_to_ist(discord.utils.utcnow())
+            if role is None:
+                await interaction.response.send_message(
+                    "Role not found anymore, contact an admin.",
+                    ephemeral=True
+                )
+                return
+
+            member = interaction.user
+
+            # Already has role
+            if role in member.roles:
+                await interaction.response.send_message(
+                    f"You already have the **{role.name}** role.",
+                    ephemeral=True
+                )
+                return
+
+            # Bot permission check
+            bot_member = guild.me
+
+            if bot_member is None:
+                bot_member = guild.get_member(interaction.client.user.id)
+
+            if (
+                bot_member is None
+                or not bot_member.guild_permissions.manage_roles
+            ):
+                await interaction.response.send_message(
+                    "I don't have the Manage Roles permission.",
+                    ephemeral=True
+                )
+                return
+
+            # Role hierarchy check
+            if bot_member.top_role.position <= role.position:
+                await interaction.response.send_message(
+                    "I cannot give this role because it is higher than my role.",
+                    ephemeral=True
+                )
+                return
+
+            # Give role
+            await member.add_roles(
+                role,
+                reason=f"Verification button used by {member}"
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-        except discord.Forbidden:
+
+            # Save log
+            await log_verification(
+                guild.id,
+                member.id,
+                role.id
+            )
+
+            # Success message
             await interaction.response.send_message(
-                "I lack permission to assign that role.", ephemeral=True
+                f"Given the **{role.name}** role.",
+                ephemeral=True
             )
+
+        except discord.Forbidden:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "I don't have permission to give this role.",
+                    ephemeral=True
+                )
+
+        except discord.HTTPException as e:
+            logger.error(
+                f"Discord API error in verification button: {e}"
+            )
+
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "Discord error happened while giving the role.",
+                    ephemeral=True
+                )
+
         except Exception as e:
-            logger.error(f"Error in dynamic verify callback: {e}")
+            logger.exception(
+                "Error in verification callback"
+            )
+
+            error_message = (
+                f"Verification failed:\n"
+                f"```{type(e).__name__}: {e}```"
+            )
+
             try:
-                await interaction.response.send_message("Something went wrong.", ephemeral=True)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        error_message,
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.followup.send(
+                        error_message,
+                        ephemeral=True
+                    )
+
             except Exception:
                 pass
-    return callback
 
+    return callback
 
 def build_panel_view(buttons_rows) -> discord.ui.View:
     """buttons_rows: iterable of (id, label, style, role_id, emoji)"""
