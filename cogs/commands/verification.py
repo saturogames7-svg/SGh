@@ -552,6 +552,7 @@ class Verification(commands.Cog):
     async def create_tables(self):
         try:
             async with aiosqlite.connect(DATABASE_PATH) as db:
+    
                 await db.execute("""
                     CREATE TABLE IF NOT EXISTS verification_panels (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -565,6 +566,7 @@ class Verification(commands.Cog):
                         created_at TEXT DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
+    
                 await db.execute("""
                     CREATE TABLE IF NOT EXISTS verification_buttons (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -576,16 +578,33 @@ class Verification(commands.Cog):
                         FOREIGN KEY (panel_id) REFERENCES verification_panels (id)
                     )
                 """)
+    
                 await db.execute("""
                     CREATE TABLE IF NOT EXISTS verification_logs (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         guild_id INTEGER NOT NULL,
                         user_id INTEGER NOT NULL,
-                        role_id INTEGER NOT NULL,
+                        role_id INTEGER,
                         verified_at TEXT NOT NULL
                     )
                 """)
+    
+                # Fix old database created without role_id
+                cursor = await db.execute(
+                    "PRAGMA table_info(verification_logs)"
+                )
+    
+                columns = [
+                    row[1] for row in await cursor.fetchall()
+                ]
+    
+                if "role_id" not in columns:
+                    await db.execute(
+                        "ALTER TABLE verification_logs ADD COLUMN role_id INTEGER"
+                    )
+    
                 await db.commit()
+    
         except Exception as e:
             logger.error(f"Error creating verification tables: {e}")
 
