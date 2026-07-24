@@ -175,7 +175,6 @@ class ButtonInfoModal(discord.ui.Modal, title="Button Settings"):
     style_input = discord.ui.TextInput(
         label="Style (green/blurple/grey/red)", max_length=20, required=False, default="green"
     )
-    emoji_input = discord.ui.TextInput(label="Emoji (optional)", max_length=20, required=False)
 
     def __init__(self, setup_view: "PanelSetupView", role: discord.Role):
         super().__init__()
@@ -186,13 +185,140 @@ class ButtonInfoModal(discord.ui.Modal, title="Button Settings"):
         if len(self.setup_view.buttons) >= 20:
             await interaction.response.send_message("Maximum of 20 buttons reached.", ephemeral=True)
             return
-        self.setup_view.buttons.append({
+
+        pending = {
             "label": str(self.label_input.value),
             "style": str(self.style_input.value) if self.style_input.value else "green",
             "role_id": self.role.id,
-            "emoji": str(self.emoji_input.value) if self.emoji_input.value else None
-        })
-        await interaction.response.edit_message(embed=self.setup_view.build_preview_embed(), view=self.setup_view)
+        }
+
+        # Move to the emoji picker step, editing the same ephemeral message
+        # that originally held the role-select menu.
+        view = EmojiSelectView(interaction.guild, self.setup_view, pending)
+        await interaction.response.edit_message(
+            content="Pick an emoji for this button from the server (optional):",
+            embed=None,
+            view=view
+        )
+
+
+class EmojiSelect(discord.ui.Select):
+    def __init__(self, parent_view: "EmojiSelectView", options):
+        super().__init__(placeholder="Choose a server emoji...", min_values=1, max_values=1, options=options)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        emoji_str = None
+        if value != "none":
+            emoji_obj = discord.utils.get(interaction.guild.emojis, id=int(value))
+            if emoji_obj:
+                emoji_str = str(emoji_obj)
+        await self.parent_view.finish(interaction, emoji_str)
+
+
+class TypeEmojiModal(discord.ui.Modal, title="Enter Emoji"):
+    emoji_input = discord.ui.TextInput(label="Emoji (unicode or custom)", required=False, max_length=100)
+
+    def __init__(self, parent_view: "EmojiSelectView"):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        value = str(self.emoji_input.value).strip() or None
+        await self.parent_view.finish(interaction, value)
+
+
+class TypeManuallyButton(discord.ui.Button):
+    def __init__(self, parent_view: "EmojiSelectView"):
+        super().__init__(label="Type Manually", style=discord.ButtonStyle.blurple)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(TypeEmojiModal(self.parent_view))
+
+
+class SkipEmojiButton(discord.ui.Button):
+    def __init__(self, parent_view: "EmojiSelectView"):
+        super().__init__(label="Skip / No Emoji", style=discord.ButtonStyle.grey)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.parent_view.finish(interaction, None)
+
+
+class EmojiSelectView(discord.ui.View):
+    """Lets the admin pick one of the server's custom emojis for a button,
+    with pagination if the server has more than 24 emojis, plus a manual
+    text fallback and a skip option."""
+
+    PAGE_SIZE = 24
+
+    def __init__(self, guild: discord.Guild, setup_view: "PanelSetupView", pending: dict, page: int = 0):
+        super().__init__(timeout=180)
+        self.guild = guild
+        self.setup_view = setup_view
+        self.pending = pending
+        self.page = page
+        self.build_items()
+
+    def build_items(self):
+        self.clear_items()
+        emojis = [e for e in self.guild.emojis if e.is_usable()]
+        start = self.page * self.PAGE_SIZE
+        chunk = emojis[start:start + self.PAGE_SIZE]
+
+        if chunk:
+            options = [
+                discord.SelectOption(label=e.name[:100], value=str(e.id), emoji=e)
+                for e in chunk
+            ]
+            self.add_item(EmojiSelect(self, options))
+
+        self.add_item(SkipEmojiButton(self))
+        self.add_item(TypeManuallyButton(self))
+
+        if start > 0:
+            self.add_item(self._nav_button("◀ Prev", -1))
+        if start + self.PAGE_SIZE < len(emojis):
+            self.add_item(self._nav_button("Next ▶", 1))
+
+    def _nav_button(self, label: str, delta: int) -> discord.ui.Button:
+        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.grey)
+
+        async def cb(interaction: discord.Interaction):
+            self.page += delta
+            self.build_items()
+            await interaction.response.edit_message(view=self)
+
+        btn.callback = cb
+        return btn
+
+    async def finish(self, interaction: discord.Interaction, emoji_str: Optional[str]):
+        if len(self.setup_view.buttons) >= 20:
+            await interaction.response.edit_message(
+                content="Maximum of 20 buttons reached.", embed=None, view=None
+            )
+            return
+
+        self.pending["emoji"] = emoji_str
+        self.setup_view.buttons.append(self.pending)
+
+        if self.setup_view.message:
+            try:
+                await self.setup_view.message.edit(
+                    embed=self.setup_view.build_preview_embed(), view=self.setup_view
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+        role_mention = f"<@&{self.pending['role_id']}>"
+        await interaction.response.edit_message(
+            content=f"✅ Button **{self.pending['label']}** added for {role_mention}.",
+            embed=None,
+            view=None
+        )
+        self.stop()
 
 
 class RoleSelectForButton(discord.ui.View):
@@ -218,12 +344,22 @@ class PanelSetupView(discord.ui.View):
         self.color_hex = "FF0000"
         self.image_url = None
         self.buttons = []  # list of dicts: label, style, role_id, emoji
+        self.message: Optional[discord.Message] = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("This setup isn't for you.", ephemeral=True)
             return False
         return True
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                for item in self.children:
+                    item.disabled = True
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.HTTPException):
+                pass
 
     def build_preview_embed(self) -> discord.Embed:
         embed = discord.Embed(
@@ -421,15 +557,17 @@ class Verification(commands.Cog):
         view = PanelSetupView(self.bot, ctx.author)
         embed = view.build_preview_embed()
         embed.title = "Panel Setup"
-        await ctx.send(
+        sent = await ctx.send(
             content=(
                 "Configure your verification panel: select a channel, edit the message "
                 "(title/description/color/image), then add one or more buttons — "
-                "each button can give a different role."
+                "each button can give a different role. When you add a button you'll "
+                "be able to pick an emoji directly from this server's emoji list."
             ),
             embed=embed,
             view=view
         )
+        view.message = sent
 
     @verification.command(name="list", description="List configured verification panels in this server.")
     @blacklist_check()
