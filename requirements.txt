@@ -27,6 +27,8 @@ duckduckgo-search==6.3.6
 colorama
 chess
 python-dateutil
+pytz
+
 deep-translator==1.11.4
 uvicorn==0.46.0
 fastapi
