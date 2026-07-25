@@ -1,4 +1,5 @@
 import discord
+import emoji as emoji_lib
 import sqlite3
 from discord.ext import commands
 from discord.ext.commands import Context
@@ -97,14 +98,26 @@ def validate_emoji(emoji: str):
     except Exception:
         return None, "مش قادر أفهم الإيموجي ده، جرب تاني."
 
-    # A valid unicode emoji has no id. A valid custom emoji has an id.
-    # If from_str couldn't find either, it just dumps the raw text into `name`
-    # with id=None, which looks "valid" here but Discord will reject later.
-    if partial.id is None and not partial.is_unicode_emoji():
+    if partial.id is not None:
+        # Custom emoji: <:name:id> or <a:name:id> — the syntax itself is valid.
+        # NOTE: this does NOT confirm the emoji still exists / is accessible to
+        # the bot (it could be deleted, or belong to a server the bot can't see
+        # it from). That failure mode is caught separately below in addoption's
+        # HTTPException handler when Discord actually rejects the update.
+        return str(partial), None
+
+    # No id present. discord.py's PartialEmoji.is_unicode_emoji() only checks
+    # "id is None" — it does NOT verify the string is a real emoji character.
+    # Plain text like "star" or a stray colon-wrapped word would pass that
+    # check and only get rejected later by Discord's API, which is exactly
+    # the bug that caused the 'Invalid Form Body' error even after our first
+    # fix. We use the `emoji` package here to actually confirm it's a genuine
+    # unicode emoji character/sequence.
+    if not emoji_lib.is_emoji(emoji):
         return None, (
-                "The emoji format is incorrect. Use a standard Unicode emoji (like 🏆) or copy the custom "
-                "emoji in its full format from Discord (type \\ before the emoji in any message "
-                "to get the correct format like <:name:id>)."
+            "الإيموجي ده مش إيموجي حقيقي. استخدم إيموجي يونيكود عادي (زي 🏆) أو "
+            "انسخ الكستم إيموجي بصيغته الكاملة من ديسكورد (اكتب `\\` قبل الإيموجي "
+            "في أي رسالة عشان ياخدلك الفورمات الصح زي `<:name:id>`)."
         )
 
     return str(partial), None
@@ -129,7 +142,7 @@ def build_select(message_id: int, custom_id: str, placeholder: str, max_values: 
         if emoji:
             try:
                 partial = discord.PartialEmoji.from_str(emoji)
-                if partial.id is not None or partial.is_unicode_emoji():
+                if partial.id is not None or emoji_lib.is_emoji(emoji):
                     kwargs["emoji"] = emoji
             except Exception:
                 pass
