@@ -79,7 +79,7 @@ class DropdownRolesDB:
 db = DropdownRolesDB()
 
 
-def validate_emoji(emoji: str):
+def validate_emoji(emoji: str, bot: commands.Bot = None):
     """
     Parses a raw emoji string typed by a user into a normalized, Discord-API-safe
     representation. Returns a (normalized_str_or_None, error_message_or_None) tuple.
@@ -89,6 +89,13 @@ def validate_emoji(emoji: str):
     were being stored as-is and passed straight to discord.SelectOption, which
     silently builds a broken PartialEmoji instead of raising early. Normalizing
     here means only emoji Discord will actually accept ever get saved.
+
+    If `bot` is passed, this also checks that a custom emoji is actually
+    accessible to the bot right now (id shows up in bot.emojis). Discord's
+    component API rejects the ENTIRE select menu's Form Body if any one
+    option's emoji is a custom emoji the bot can't currently see (deleted,
+    or living in a guild the bot isn't a member of) — format alone being
+    correct isn't enough.
     """
     if not emoji:
         return None, None
@@ -99,11 +106,16 @@ def validate_emoji(emoji: str):
         return None, "مش قادر أفهم الإيموجي ده، جرب تاني."
 
     if partial.id is not None:
-        # Custom emoji: <:name:id> or <a:name:id> — the syntax itself is valid.
-        # NOTE: this does NOT confirm the emoji still exists / is accessible to
-        # the bot (it could be deleted, or belong to a server the bot can't see
-        # it from). That failure mode is caught separately below in addoption's
-        # HTTPException handler when Discord actually rejects the update.
+        # Custom emoji: <:name:id> or <a:name:id> — syntax is valid, but that's
+        # not enough. Confirm the bot can actually see/use this emoji right now.
+        if bot is not None:
+            accessible_ids = {e.id for e in bot.emojis}
+            if partial.id not in accessible_ids:
+                return None, (
+                    "الإيموجي ده مش متاح للبوت. إما اتمسح، أو البوت مش موجود في "
+                    "السيرفر بتاع الإيموجي ده. لازم البوت يكون عضو في نفس السيرفر "
+                    "بتاع الإيموجي عشان يقدر يستخدمه في المنيو."
+                )
         return str(partial), None
 
     # No id present. discord.py's PartialEmoji.is_unicode_emoji() only checks
@@ -115,9 +127,9 @@ def validate_emoji(emoji: str):
     # unicode emoji character/sequence.
     if not emoji_lib.is_emoji(emoji):
         return None, (
-            "The emoji format is incorrect. Use a standard Unicode emoji (like 🏆) or copy the custom "
-            "emoji in its full format from Discord (type \\ before the emoji in any message "
-            "to get the correct format like <:name:id>)."
+            "الإيموجي ده مش إيموجي حقيقي. استخدم إيموجي يونيكود عادي (زي 🏆) أو "
+            "انسخ الكستم إيموجي بصيغته الكاملة من ديسكورد (اكتب `\\` قبل الإيموجي "
+            "في أي رسالة عشان ياخدلك الفورمات الصح زي `<:name:id>`)."
         )
 
     return str(partial), None
@@ -228,6 +240,57 @@ class DropdownRoles(Cog):
             view = RoleDropdownView(message_id, custom_id, placeholder, max_values)
             self.bot.add_view(view, message_id=message_id)
 
+    @commands.hybrid_command(name="checkoptions", help="Diagnose which stored option(s) have a broken emoji.", usage="checkoptions <message_id>")
+    @commands.has_permissions(manage_roles=True)
+    async def checkoptions(self, ctx: Context, message_id: int):
+        menu = db.get_menu(message_id)
+        if not menu:
+            await ctx.send(f"{CROSS} No dropdown menu found with that message ID.", ephemeral=True if ctx.interaction else False)
+            return
+
+        options = db.get_options(message_id)
+        if not options:
+            await ctx.send("No options stored for this menu yet.", ephemeral=True if ctx.interaction else False)
+            return
+
+        # Every custom emoji ID the bot can actually use across ALL guilds it's
+        # currently a member of (this is what Discord checks server-side when
+        # you use emoji= in a component — not just "does this ID look valid").
+        accessible_ids = {str(e.id) for e in self.bot.emojis}
+
+        lines = []
+        for role_id, label, description, emoji_str in options:
+            role = ctx.guild.get_role(role_id)
+            role_name = role.name if role else f"(deleted role {role_id})"
+
+            if not emoji_str:
+                lines.append(f"⚪ **{label}** ({role_name}) — no emoji set")
+                continue
+
+            try:
+                partial = discord.PartialEmoji.from_str(emoji_str)
+            except Exception:
+                lines.append(f"🔴 **{label}** ({role_name}) — `{emoji_str}` cannot be parsed at all")
+                continue
+
+            if partial.id is None:
+                # unicode emoji, presumably fine — format already validated at addoption time
+                lines.append(f"🟢 **{label}** ({role_name}) — unicode emoji {emoji_str}")
+                continue
+
+            if str(partial.id) in accessible_ids:
+                lines.append(f"🟢 **{label}** ({role_name}) — {emoji_str} (accessible)")
+            else:
+                lines.append(
+                    f"🔴 **{label}** ({role_name}) — {emoji_str} — **NOT accessible to the bot** "
+                    f"(deleted, or the bot isn't in the emoji's home server)"
+                )
+
+        await ctx.send(
+            f"**Emoji check for menu `{message_id}`:**\n" + "\n".join(lines),
+            ephemeral=True if ctx.interaction else False
+        )
+
     @commands.hybrid_command(name="createdropdown", help="Attach a dropdown role menu to an existing message.", usage="createdropdown <channel> <message_id>")
     @commands.has_permissions(manage_roles=True)
     async def createdropdown(self, ctx: Context, channel: discord.TextChannel, message_id: int):
@@ -272,9 +335,43 @@ class DropdownRoles(Cog):
             ephemeral=True if ctx.interaction else False
         )
 
-    @commands.hybrid_command(name="addoption", help="Add a role option to a dropdown menu.", usage="addoption <message_id> <role> <label> [emoji]")
+    @commands.hybrid_command(
+        name="addoption",
+        help="Add a role option to a dropdown menu.",
+        usage="addoption <message_id> <role> <label with spaces> [emoji]"
+    )
     @commands.has_permissions(manage_roles=True)
-    async def addoption(self, ctx: Context, message_id: int, role: discord.Role, label: str, emoji: str = None):
+    async def addoption(self, ctx: Context, message_id: int, role: discord.Role, *, label_and_emoji: str):
+        # ---- Split "label" from an optional trailing "emoji" ----
+        # Previously label and emoji were separate parameters, which meant
+        # discord.py split on every space and broke multi-word labels
+        # ("RoK Services" became label="RoK", emoji="Services"). Now we take
+        # the whole rest of the message as one block, and only peel off the
+        # LAST word as the emoji if it actually looks like a real emoji
+        # (custom <:name:id>/<a:name:id> or a genuine unicode emoji char).
+        # Everything else — spaces and all — stays as the label.
+        text = label_and_emoji.strip()
+        label = text
+        emoji = None
+
+        if " " in text:
+            possible_label, possible_emoji = text.rsplit(" ", 1)
+            possible_emoji = possible_emoji.strip()
+            looks_like_emoji = False
+            try:
+                partial = discord.PartialEmoji.from_str(possible_emoji)
+                looks_like_emoji = partial.id is not None or emoji_lib.is_emoji(possible_emoji)
+            except Exception:
+                looks_like_emoji = False
+
+            if looks_like_emoji:
+                label = possible_label.strip()
+                emoji = possible_emoji
+
+        if not label:
+            await ctx.send(f"{CROSS} You need to provide a label for the role.", ephemeral=True if ctx.interaction else False)
+            return
+
         menu = db.get_menu(message_id)
         if not menu:
             await ctx.send(f"{CROSS} No dropdown menu found with that message ID.", ephemeral=True if ctx.interaction else False)
@@ -284,7 +381,7 @@ class DropdownRoles(Cog):
         # This is the actual fix: previously the raw user-typed string was stored
         # as-is and only failed later, at build time, when Discord rejected the
         # entire Form Body for the whole select menu (all 25 options at once).
-        clean_emoji, error = validate_emoji(emoji)
+        clean_emoji, error = validate_emoji(emoji, bot=self.bot)
         if error:
             await ctx.send(f"{CROSS} {error}", ephemeral=True if ctx.interaction else False)
             return
@@ -353,3 +450,4 @@ class DropdownRoles(Cog):
 
 async def setup(bot):
     await bot.add_cog(DropdownRoles(bot))
+    
