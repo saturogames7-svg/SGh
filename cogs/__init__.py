@@ -1,17 +1,3 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                                                                  ║
-# ║   ░█▀▀░█▀█░█▀▄░█▀▀░█░█   ░█▀▄░█▀▀░█░█░█▀▀                     ║
-# ║   ░█░░░█░█░█░█░█▀▀░▄▀▄   ░█░█░█▀▀░▀▄▀░▀▀█                     ║
-# ║   ░▀▀▀░▀▀▀░▀▀░░▀▀▀░▀░▀   ░▀▀░░▀▀▀░░▀░░▀▀▀                     ║
-# ║                                                                  ║
-# ║            © 2026 CodeX Devs — All Rights Reserved              ║
-# ║                                                                  ║
-# ║   discord  ──  https://discord.gg/codexdev                      ║
-# ║   youtube  ──  https://youtube.com/@CodeXDevs                   ║
-# ║   github   ──  https://github.com/RayExo                        ║
-# ║                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
 from __future__ import annotations
 from core import zyrox
 from colorama import Fore, Style, init
@@ -65,6 +51,7 @@ from .commands.owner2 import Global
 from .commands.qr import QR
 from .commands.vanityroles import VanityRoles
 from .commands.reactionroles import ReactionRoles 
+from .commands.dropdownroles import DropdownRoles
 from .commands.messages import Messages
 from .commands.fastgreet import FastGreet
 from .commands.counting import Counting
@@ -244,6 +231,7 @@ async def setup(bot: zyrox):
   await bot.add_cog(QR(bot))
   await bot.add_cog(VanityRoles(bot))
   await bot.add_cog(ReactionRoles(bot))
+  await bot.add_cog(DropdownRoles(bot))
   await bot.add_cog(Messages(bot))
   await bot.add_cog(TranslateCog(bot))
   await bot.add_cog(FastGreet(bot))
