@@ -61,9 +61,16 @@ class Giveaway(commands.Cog):
         self.bot = bot
 
     async def cog_load(self) -> None:
+        # NOTE: we keep self.connection but no longer share a single cursor.
+        # Every query below opens its own short-lived cursor via
+        # `self.connection.execute(...)`. Sharing one cursor between the
+        # gstart/gend/greroll/glist commands AND the GiveawayEnd background
+        # task (which runs every 5s) was causing command calls to hang
+        # forever with no error, since aiosqlite cursors aren't safe to use
+        # concurrently from multiple coroutines at once.
         self.connection = await aiosqlite.connect(db_path)
-        self.cursor = await self.connection.cursor()
-        await self.check_for_ended_giveaways() 
+        self.connection.row_factory = aiosqlite.Row
+        await self.check_for_ended_giveaways()
         self.GiveawayEnd.start()
 
     async def cog_unload(self) -> None:
@@ -71,8 +78,11 @@ class Giveaway(commands.Cog):
         await self.connection.close()
 
     async def check_for_ended_giveaways(self):
-        await self.cursor.execute("SELECT ends_at, guild_id, message_id, host_id, winners, prize, channel_id FROM Giveaway WHERE ends_at <= ?", (datetime.datetime.now().timestamp(),))
-        ended_giveaways = await self.cursor.fetchall()
+        async with self.connection.execute(
+            "SELECT ends_at, guild_id, message_id, host_id, winners, prize, channel_id FROM Giveaway WHERE ends_at <= ?",
+            (datetime.datetime.now().timestamp(),)
+        ) as cur:
+            ended_giveaways = await cur.fetchall()
         for giveaway in ended_giveaways:
             await self.end_giveaway(giveaway)
 
@@ -81,7 +91,7 @@ class Giveaway(commands.Cog):
             current_time = datetime.datetime.now().timestamp()
             guild = self.bot.get_guild(int(giveaway[1]))
             if guild is None:
-                await self.cursor.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (giveaway[2], giveaway[1]))
+                await self.connection.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (giveaway[2], giveaway[1]))
                 await self.connection.commit()
                 return
 
@@ -94,7 +104,7 @@ class Giveaway(commands.Cog):
                             message = await channel.fetch_message(int(giveaway[2]))
                             break
                         except discord.NotFound:
-                            await self.cursor.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (giveaway[2], giveaway[1]))
+                            await self.connection.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (giveaway[2], giveaway[1]))
                             await self.connection.commit()
                             return
                         except aiohttp.ClientResponseError as e:
@@ -113,7 +123,7 @@ class Giveaway(commands.Cog):
 
                     if len(users) < 1:
                         await message.reply(f"No one won the **{giveaway[5]}** giveaway, due to Not enough participants.")
-                        await self.cursor.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
+                        await self.connection.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
                         await self.connection.commit()
                         return
 
@@ -125,7 +135,7 @@ class Giveaway(commands.Cog):
 
                     await message.edit(content=f"{TADAA} **GIVEAWAY ENDED** {TADAA}", view=view)
                     await message.reply(f"{TADAA} Congrats {winner}, you won **{giveaway[5]}!**, Hosted by <@{int(giveaway[3])}>")
-                    await self.cursor.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
+                    await self.connection.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
                     await self.connection.commit()
 
                 except (discord.HTTPException, aiohttp.ClientResponseError) as e:
@@ -133,13 +143,16 @@ class Giveaway(commands.Cog):
 
         except IndexError:
             logging.error(f"Giveaway data is corrupted or missing: {giveaway}")
-            await self.cursor.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (giveaway[2], giveaway[1]))
+            await self.connection.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (giveaway[2], giveaway[1]))
             await self.connection.commit()
 
     @tasks.loop(seconds=5)
     async def GiveawayEnd(self):
-        await self.cursor.execute("SELECT ends_at, guild_id, message_id, host_id, winners, prize, channel_id FROM Giveaway WHERE ends_at <= ?", (datetime.datetime.now().timestamp(),))
-        ends_raw = await self.cursor.fetchall()
+        async with self.connection.execute(
+            "SELECT ends_at, guild_id, message_id, host_id, winners, prize, channel_id FROM Giveaway WHERE ends_at <= ?",
+            (datetime.datetime.now().timestamp(),)
+        ) as cur:
+            ends_raw = await cur.fetchall()
         for giveaway in ends_raw:
             await self.end_giveaway(giveaway)
 
@@ -179,8 +192,8 @@ class Giveaway(commands.Cog):
             await message.delete()
             return
 
-        await self.cursor.execute("SELECT message_id, channel_id FROM Giveaway WHERE guild_id = ?", (ctx.guild.id,))
-        re = await self.cursor.fetchall()
+        async with self.connection.execute("SELECT message_id, channel_id FROM Giveaway WHERE guild_id = ?", (ctx.guild.id,)) as cur:
+            re = await cur.fetchall()
 
         g_list = [i[0] for i in re]
         if len(g_list) >= 5:
@@ -223,10 +236,13 @@ class Giveaway(commands.Cog):
             except Exception:
                 real_message = message
 
-        await self.cursor.execute("INSERT INTO Giveaway(guild_id, host_id, start_time, ends_at, prize, winners, message_id, channel_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (ctx.guild.id, ctx.author.id, datetime.datetime.now(), ends, prize, winners, real_message.id, ctx.channel.id))
+        await self.connection.execute(
+            "INSERT INTO Giveaway(guild_id, host_id, start_time, ends_at, prize, winners, message_id, channel_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            (ctx.guild.id, ctx.author.id, datetime.datetime.now(), ends, prize, winners, real_message.id, ctx.channel.id)
+        )
+        await self.connection.commit()
 
         await real_message.add_reaction(TADAA)
-        await self.connection.commit()
 
 
     @commands.Cog.listener("on_message_delete")
@@ -234,15 +250,15 @@ class Giveaway(commands.Cog):
         if message.guild is None:
             return
 
-        await self.cursor.execute("SELECT message_id FROM Giveaway WHERE guild_id = ?", (message.guild.id,))
-        re = await self.cursor.fetchone()
+        async with self.connection.execute("SELECT message_id FROM Giveaway WHERE guild_id = ?", (message.guild.id,)) as cur:
+            re = await cur.fetchone()
 
         if message.author != self.bot.user:
             return
 
         if re is not None:
             if message.id == int(re[0]):
-                await self.cursor.execute("DELETE FROM Giveaway WHERE channel_id = ? AND message_id = ? AND guild_id = ?", (message.channel.id, message.id, message.guild.id))
+                await self.connection.execute("DELETE FROM Giveaway WHERE channel_id = ? AND message_id = ? AND guild_id = ?", (message.channel.id, message.id, message.guild.id))
 
                 print(f"Giveaway message deleted in {message.guild.name} - {message.guild.id}")
                 await self.connection.commit()
@@ -267,8 +283,8 @@ class Giveaway(commands.Cog):
 
         if message_id is not None:
             current_time = datetime.datetime.now().timestamp()
-            await self.cursor.execute('SELECT ends_at, guild_id, message_id, host_id, winners, prize, channel_id FROM Giveaway WHERE message_id = ?', (int(message_id),))
-            re = await self.cursor.fetchone()
+            async with self.connection.execute('SELECT ends_at, guild_id, message_id, host_id, winners, prize, channel_id FROM Giveaway WHERE message_id = ?', (int(message_id),)) as cur:
+                re = await cur.fetchone()
 
             if re is None:
                 message = await ctx.send(view=CV2("❌ Error", "The giveaway was not found."))
@@ -286,7 +302,7 @@ class Giveaway(commands.Cog):
             if len(users) < 1:
                 await ctx.send(f"{TICK} Successfully Ended the giveaway in <#{int(re[6])}>")
                 await message.reply(f"No one won the **{re[5]}** giveaway, due to Not enough participants.")
-                await self.cursor.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
+                await self.connection.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
                 await self.connection.commit()
                 return
 
@@ -301,11 +317,11 @@ class Giveaway(commands.Cog):
                 await ctx.send(f"{TADAA} Successfully ended the giveaway in <#{int(re[6])}>")
 
             await message.reply(f" Congrats {winner}, you won **{re[5]}!**, Hosted by <@{int(re[3])}>")
-            await self.cursor.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
+            await self.connection.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
 
         elif ctx.message and ctx.message.reference:
-            await self.cursor.execute('SELECT ends_at, guild_id, message_id, host_id, winners, prize, channel_id FROM Giveaway WHERE message_id = ?', (ctx.message.reference.resolved.id,))
-            re = await self.cursor.fetchone()
+            async with self.connection.execute('SELECT ends_at, guild_id, message_id, host_id, winners, prize, channel_id FROM Giveaway WHERE message_id = ?', (ctx.message.reference.resolved.id,)) as cur:
+                re = await cur.fetchone()
 
             if re is None:
                 return await ctx.send(f"The giveaway was not found.")
@@ -320,7 +336,7 @@ class Giveaway(commands.Cog):
 
             if len(users) < 1:
                 await message.reply(f"No one won the **{re[5]}** giveaway, due to not enough participants.")
-                await self.cursor.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
+                await self.connection.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
                 await self.connection.commit()
                 return
 
@@ -332,7 +348,7 @@ class Giveaway(commands.Cog):
             await message.edit(content="🎁 **GIVEAWAY ENDED** 🎁", view=view)
 
             await message.reply(f"💐 Congrats {winner}, you won **{re[5]}!**, Hosted by <@{int(re[3])}>")
-            await self.cursor.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
+            await self.connection.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
 
         else:
             await ctx.send("Please reply to the giveaway message or provide the giveaway ID.")
@@ -369,8 +385,8 @@ class Giveaway(commands.Cog):
                 await msg.delete()
             return
 
-        await self.cursor.execute(f"SELECT message_id FROM Giveaway WHERE message_id = ?", (message.id,))
-        re = await self.cursor.fetchone()
+        async with self.connection.execute("SELECT message_id FROM Giveaway WHERE message_id = ?", (message.id,)) as cur:
+            re = await cur.fetchone()
 
         if re is not None:
             msg = await ctx.send(view=CV2("⚠️ Access Denied", "The giveaway is currently running. Please use the `gend` command instead to end the giveaway."))
@@ -389,7 +405,6 @@ class Giveaway(commands.Cog):
 
         winners = random.sample(users, k=1)
         await ctx.send(" The new winner is " + ", ".join(f"<@{i}>" for i in winners) + ". Congratulations!")
-        await self.connection.commit()
 
     def convert(self, time):
         pos = ["s", "m", "h", "d"]
@@ -416,8 +431,8 @@ class Giveaway(commands.Cog):
         if ctx.interaction:
             await ctx.defer()
 
-        await self.cursor.execute("SELECT prize, ends_at, winners, message_id FROM Giveaway WHERE guild_id = ?", (ctx.guild.id,))
-        giveaways = await self.cursor.fetchall()
+        async with self.connection.execute("SELECT prize, ends_at, winners, message_id FROM Giveaway WHERE guild_id = ?", (ctx.guild.id,)) as cur:
+            giveaways = await cur.fetchall()
 
         if not giveaways:
             await ctx.send(view=CV2("Ongoing Giveaways", "No ongoing giveaways."))
