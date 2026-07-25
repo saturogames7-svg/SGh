@@ -171,12 +171,23 @@ class DropdownRoles(Cog):
             view = RoleDropdownView(message_id, custom_id, placeholder, max_values)
             self.bot.add_view(view, message_id=message_id)
 
-    @commands.hybrid_command(name="createdropdown", help="Create a dropdown role menu.", usage="createdropdown <channel> <title> <description>")
+    @commands.hybrid_command(name="createdropdown", help="Attach a dropdown role menu to an existing message.", usage="createdropdown <channel> <message_id>")
     @commands.has_permissions(manage_roles=True)
-    async def createdropdown(self, ctx: Context, channel: discord.TextChannel, title: str, *, description: str):
-        embed = discord.Embed(title=title, description=description, color=0xFF0000)
+    async def createdropdown(self, ctx: Context, channel: discord.TextChannel, message_id: int):
+        try:
+            message = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            await ctx.send(f"{CROSS} Message not found in {channel.mention}. Make sure the message ID is correct.", ephemeral=True if ctx.interaction else False)
+            return
+        except discord.Forbidden:
+            await ctx.send(f"{CROSS} I don't have permission to read messages in {channel.mention}.", ephemeral=True if ctx.interaction else False)
+            return
 
-        custom_id = f"dropdown_role_menu:{channel.id}:{ctx.message.id if not ctx.interaction else ctx.interaction.id}"
+        if message.author.id != self.bot.user.id:
+            await ctx.send(f"{CROSS} That message wasn't sent by me, so I can't attach a menu to it. Send/build the embed using my embed command first, then run this on it.", ephemeral=True if ctx.interaction else False)
+            return
+
+        custom_id = f"dropdown_role_menu:{channel.id}:{message.id}"
 
         placeholder_view = discord.ui.View(timeout=None)
         placeholder_select = discord.ui.Select(
@@ -188,7 +199,11 @@ class DropdownRoles(Cog):
         )
         placeholder_view.add_item(placeholder_select)
 
-        message = await channel.send(embed=embed, view=placeholder_view)
+        try:
+            await message.edit(view=placeholder_view)
+        except discord.Forbidden:
+            await ctx.send(f"{CROSS} I don't have permission to edit that message (it must be sent by me).", ephemeral=True if ctx.interaction else False)
+            return
 
         db.create_menu(message.id, ctx.guild.id, channel.id, custom_id, "Choose your roles", max_values=1)
 
@@ -196,7 +211,7 @@ class DropdownRoles(Cog):
         self.bot.add_view(real_view, message_id=message.id)
 
         await ctx.send(
-            f"{TICK} Dropdown menu created in {channel.mention}.\nMessage ID: `{message.id}`\nUse `addoption {message.id} <role> <label>` to add roles.",
+            f"{TICK} Dropdown menu attached to that message in {channel.mention}.\nMessage ID: `{message.id}`\nUse `addoption {message.id} <role> <label>` to add roles.",
             ephemeral=True if ctx.interaction else False
         )
 
@@ -261,3 +276,4 @@ class DropdownRoles(Cog):
 
 async def setup(bot):
     await bot.add_cog(DropdownRoles(bot))
+    
