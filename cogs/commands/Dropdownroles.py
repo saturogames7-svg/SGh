@@ -78,19 +78,63 @@ class DropdownRolesDB:
 db = DropdownRolesDB()
 
 
+def validate_emoji(emoji: str):
+    """
+    Parses a raw emoji string typed by a user into a normalized, Discord-API-safe
+    representation. Returns a (normalized_str_or_None, error_message_or_None) tuple.
+
+    This is the fix for the 'Invalid Form Body: emoji.name' errors: raw, badly
+    formatted emoji strings (bare IDs, bare names, malformed custom emoji syntax)
+    were being stored as-is and passed straight to discord.SelectOption, which
+    silently builds a broken PartialEmoji instead of raising early. Normalizing
+    here means only emoji Discord will actually accept ever get saved.
+    """
+    if not emoji:
+        return None, None
+
+    try:
+        partial = discord.PartialEmoji.from_str(emoji)
+    except Exception:
+        return None, "مش قادر أفهم الإيموجي ده، جرب تاني."
+
+    # A valid unicode emoji has no id. A valid custom emoji has an id.
+    # If from_str couldn't find either, it just dumps the raw text into `name`
+    # with id=None, which looks "valid" here but Discord will reject later.
+    if partial.id is None and not partial.is_unicode_emoji():
+        return None, (
+                "The emoji format is incorrect. Use a standard Unicode emoji (like 🏆) or copy the custom "
+                "emoji in its full format from Discord (type \\ before the emoji in any message "
+                "to get the correct format like <:name:id>)."
+        )
+
+    return str(partial), None
+
+
 def build_select(message_id: int, custom_id: str, placeholder: str, max_values: int):
     options_data = db.get_options(message_id)
 
     select_options = []
     for role_id, label, description, emoji in options_data:
-        select_options.append(
-            discord.SelectOption(
-                label=label,
-                value=str(role_id),
-                description=description if description else None,
-                emoji=emoji if emoji else None,
-            )
+        kwargs = dict(
+            label=label,
+            value=str(role_id),
+            description=description if description else None,
         )
+
+        # Defensive re-check at build time too: even though addoption now
+        # validates before saving, this guards against any bad data that was
+        # stored previously. A single broken emoji here used to invalidate
+        # the whole Form Body (all options), so we now just drop that one
+        # option's emoji instead of failing the entire select menu.
+        if emoji:
+            try:
+                partial = discord.PartialEmoji.from_str(emoji)
+                if partial.id is not None or partial.is_unicode_emoji():
+                    kwargs["emoji"] = emoji
+            except Exception:
+                pass
+
+        select_options.append(discord.SelectOption(**kwargs))
 
     if not select_options:
         select_options.append(discord.SelectOption(label="No roles configured yet", value="none"))
@@ -223,6 +267,15 @@ class DropdownRoles(Cog):
             await ctx.send(f"{CROSS} No dropdown menu found with that message ID.", ephemeral=True if ctx.interaction else False)
             return
 
+        # ---- Validate & normalize the emoji BEFORE saving it ----
+        # This is the actual fix: previously the raw user-typed string was stored
+        # as-is and only failed later, at build time, when Discord rejected the
+        # entire Form Body for the whole select menu (all 25 options at once).
+        clean_emoji, error = validate_emoji(emoji)
+        if error:
+            await ctx.send(f"{CROSS} {error}", ephemeral=True if ctx.interaction else False)
+            return
+
         _, guild_id, channel_id, custom_id, placeholder, max_values = menu
 
         existing = db.get_options(message_id)
@@ -230,7 +283,7 @@ class DropdownRoles(Cog):
             await ctx.send(f"{CROSS} A dropdown menu can only have up to 25 options.", ephemeral=True if ctx.interaction else False)
             return
 
-        db.add_option(message_id, role.id, label, None, emoji)
+        db.add_option(message_id, role.id, label, None, clean_emoji)
 
         new_max_values = min(len(existing) + 1, 25)
         db.create_menu(message_id, guild_id, channel_id, custom_id, placeholder, new_max_values)
@@ -243,6 +296,17 @@ class DropdownRoles(Cog):
             self.bot.add_view(new_view, message_id=message_id)
         except discord.NotFound:
             await ctx.send(f"{CROSS} The original message could not be found (it may have been deleted).", ephemeral=True if ctx.interaction else False)
+            return
+        except discord.HTTPException as e:
+            # Extra safety net: if Discord still rejects the form body for any
+            # reason (e.g. a bad emoji left over from before this fix), roll
+            # back the just-added option instead of leaving the menu broken.
+            db.remove_option(message_id, role.id)
+            db.create_menu(message_id, guild_id, channel_id, custom_id, placeholder, len(existing))
+            await ctx.send(
+                f"{CROSS} Discord rejected the update ({e}). The option wasn't saved — check the emoji and try again.",
+                ephemeral=True if ctx.interaction else False
+            )
             return
 
         await ctx.send(f"{TICK} Added **{role.name}** to the dropdown menu.", ephemeral=True if ctx.interaction else False)
@@ -276,4 +340,3 @@ class DropdownRoles(Cog):
 
 async def setup(bot):
     await bot.add_cog(DropdownRoles(bot))
-    
