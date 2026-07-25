@@ -4,6 +4,7 @@ jishaku
 mcstatus
 discord-ext-menus
 aiohttp
+emoji
 flask
 psutil
 requests
