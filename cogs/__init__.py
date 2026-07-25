@@ -51,7 +51,7 @@ from .commands.owner2 import Global
 from .commands.qr import QR
 from .commands.vanityroles import VanityRoles
 from .commands.reactionroles import ReactionRoles 
-from .commands.dropdownroles import DropdownRoles
+from .commands.Dropdownroles import DropdownRoles
 from .commands.messages import Messages
 from .commands.fastgreet import FastGreet
 from .commands.counting import Counting
