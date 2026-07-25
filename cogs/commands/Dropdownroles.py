@@ -127,9 +127,9 @@ def validate_emoji(emoji: str, bot: commands.Bot = None):
     # unicode emoji character/sequence.
     if not emoji_lib.is_emoji(emoji):
         return None, (
-            "الإيموجي ده مش إيموجي حقيقي. استخدم إيموجي يونيكود عادي (زي 🏆) أو "
-            "انسخ الكستم إيموجي بصيغته الكاملة من ديسكورد (اكتب `\\` قبل الإيموجي "
-            "في أي رسالة عشان ياخدلك الفورمات الصح زي `<:name:id>`)."
+            "The emoji format is incorrect. Use a standard Unicode emoji (like 🏆) or copy the custom "
+            "emoji in its full format from Discord (type \\ before the emoji in any message "
+            "to get the correct format like <:name:id>)."
         )
 
     return str(partial), None
