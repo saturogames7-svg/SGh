@@ -1,17 +1,3 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                                                                  ║
-# ║   ░█▀▀░█▀█░█▀▄░█▀▀░█░█   ░█▀▄░█▀▀░█░█░█▀▀                     ║
-# ║   ░█░░░█░█░█░█░█▀▀░▄▀▄   ░█░█░█▀▀░▀▄▀░▀▀█                     ║
-# ║   ░▀▀▀░▀▀▀░▀▀░░▀▀▀░▀░▀   ░▀▀░░▀▀▀░░▀░░▀▀▀                     ║
-# ║                                                                  ║
-# ║            © 2026 CodeX Devs — All Rights Reserved              ║
-# ║                                                                  ║
-# ║   discord  ──  https://discord.gg/codexdev                      ║
-# ║   youtube  ──  https://youtube.com/@CodeXDevs                   ║
-# ║   github   ──  https://github.com/RayExo                        ║
-# ║                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
 from discord.ext import commands, tasks
 import datetime, pytz, time as t
 from discord.ui import Button, Select, View
@@ -81,6 +67,7 @@ class Giveaway(commands.Cog):
         self.GiveawayEnd.start()
 
     async def cog_unload(self) -> None:
+        self.GiveawayEnd.cancel()
         await self.connection.close()
 
     async def check_for_ended_giveaways(self):
@@ -157,8 +144,6 @@ class Giveaway(commands.Cog):
             await self.end_giveaway(giveaway)
 
 
-
-
     @commands.hybrid_command(description="Starts a new giveaway.")
     @blacklist_check()
     @ignore_check()
@@ -170,28 +155,12 @@ class Giveaway(commands.Cog):
                       *,
                       prize: str):
 
-        await self.cursor.execute("SELECT message_id, channel_id FROM Giveaway WHERE guild_id = ?", (ctx.guild.id,))
-        re = await self.cursor.fetchall()
-
-        if winners >=  15:
-            message = await ctx.send(view=CV2("⚠️ Access Denied", "Cannot exceed more than 15 winners."))
-            await asyncio.sleep(5)
-            await message.delete()
-            return
-
-        g_list = [i[0] for i in re]
-        if len(g_list) >= 5:
-            message = await ctx.send(view=CV2("⚠️ Access Denied", "You can only host upto 5 giveaways in this Guild."))
-            await asyncio.sleep(5)
-            await message.delete()
-            return
+        # IMPORTANT: defer immediately so Discord doesn't time out the interaction
+        # (fixes "The application did not respond")
+        if ctx.interaction:
+            await ctx.defer()
 
         converted = self.convert(time)
-        if converted / 60 >= 50400:
-            message = await ctx.send(view=CV2("⚠️ Access Denied", "Time cannot exceed 31 days!"))
-            await asyncio.sleep(5)
-            await message.delete()
-            return
 
         if converted == -1:
             message = await ctx.send(view=CV2("❌ Error", "Invalid time format"))
@@ -200,6 +169,28 @@ class Giveaway(commands.Cog):
             return
         if converted == -2:
             message = await ctx.send(view=CV2("❌ Error", "Invalid time format. Please provide the time in numbers."))
+            await asyncio.sleep(5)
+            await message.delete()
+            return
+
+        if winners >= 15:
+            message = await ctx.send(view=CV2("⚠️ Access Denied", "Cannot exceed more than 15 winners."))
+            await asyncio.sleep(5)
+            await message.delete()
+            return
+
+        await self.cursor.execute("SELECT message_id, channel_id FROM Giveaway WHERE guild_id = ?", (ctx.guild.id,))
+        re = await self.cursor.fetchall()
+
+        g_list = [i[0] for i in re]
+        if len(g_list) >= 5:
+            message = await ctx.send(view=CV2("⚠️ Access Denied", "You can only host upto 5 giveaways in this Guild."))
+            await asyncio.sleep(5)
+            await message.delete()
+            return
+
+        if converted / 60 >= 50400:
+            message = await ctx.send(view=CV2("⚠️ Access Denied", "Time cannot exceed 31 days!"))
             await asyncio.sleep(5)
             await message.delete()
             return
@@ -216,21 +207,33 @@ class Giveaway(commands.Cog):
         view = CV2(f"{TADAA} {prize}", desc)
 
         message = await ctx.send(f"{TADAA} **GIVEAWAY** {TADAA}", view=view)
-        try:
-           await ctx.message.delete()
-        except:
-            pass
 
-        await self.cursor.execute("INSERT INTO Giveaway(guild_id, host_id, start_time, ends_at, prize, winners, message_id, channel_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (ctx.guild.id, ctx.author.id, datetime.datetime.now(), ends, prize, winners, message.id, ctx.channel.id))
+        if not ctx.interaction:
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
 
-        await message.add_reaction(TADAA)
+        # ctx.send returns the interaction's followup/original message for slash commands too,
+        # but we need the actual channel message object to react on it.
+        real_message = message
+        if ctx.interaction:
+            try:
+                real_message = await ctx.interaction.original_response()
+            except Exception:
+                real_message = message
+
+        await self.cursor.execute("INSERT INTO Giveaway(guild_id, host_id, start_time, ends_at, prize, winners, message_id, channel_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (ctx.guild.id, ctx.author.id, datetime.datetime.now(), ends, prize, winners, real_message.id, ctx.channel.id))
+
+        await real_message.add_reaction(TADAA)
         await self.connection.commit()
 
-    
-                                    
 
     @commands.Cog.listener("on_message_delete")
     async def GiveawayMessageDelete(self, message):
+        if message.guild is None:
+            return
+
         await self.cursor.execute("SELECT message_id FROM Giveaway WHERE guild_id = ?", (message.guild.id,))
         re = await self.cursor.fetchone()
 
@@ -250,6 +253,9 @@ class Giveaway(commands.Cog):
     @commands.cooldown(1, 5, commands.BucketType.user)
     @commands.has_guild_permissions(manage_guild=True)
     async def gend(self, ctx, message_id = None):
+        if ctx.interaction:
+            await ctx.defer()
+
         if message_id:
             try:
                 int(message_id)
@@ -274,12 +280,14 @@ class Giveaway(commands.Cog):
             message = await ch.fetch_message(int(message_id))
 
             users = [i.id async for i in message.reactions[0].users()]
-            users.remove(self.bot.user.id)
+            if self.bot.user.id in users:
+                users.remove(self.bot.user.id)
 
             if len(users) < 1:
                 await ctx.send(f"{TICK} Successfully Ended the giveaway in <#{int(re[6])}>")
                 await message.reply(f"No one won the **{re[5]}** giveaway, due to Not enough participants.")
                 await self.cursor.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
+                await self.connection.commit()
                 return
 
             winner = ', '.join(f'<@!{i}>' for i in random.sample(users, k=int(re[4])))
@@ -295,7 +303,7 @@ class Giveaway(commands.Cog):
             await message.reply(f" Congrats {winner}, you won **{re[5]}!**, Hosted by <@{int(re[3])}>")
             await self.cursor.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
 
-        elif ctx.message.reference:
+        elif ctx.message and ctx.message.reference:
             await self.cursor.execute('SELECT ends_at, guild_id, message_id, host_id, winners, prize, channel_id FROM Giveaway WHERE message_id = ?', (ctx.message.reference.resolved.id,))
             re = await self.cursor.fetchone()
 
@@ -313,6 +321,7 @@ class Giveaway(commands.Cog):
             if len(users) < 1:
                 await message.reply(f"No one won the **{re[5]}** giveaway, due to not enough participants.")
                 await self.cursor.execute("DELETE FROM Giveaway WHERE message_id = ? AND guild_id = ?", (message.id, message.guild.id))
+                await self.connection.commit()
                 return
 
             winner = ', '.join(f'<@!{i}>' for i in random.sample(users, k=int(re[4])))
@@ -327,6 +336,8 @@ class Giveaway(commands.Cog):
 
         else:
             await ctx.send("Please reply to the giveaway message or provide the giveaway ID.")
+            return
+
         await self.connection.commit()
 
     @commands.hybrid_command(description="Rerolls a giveaway on replying the giveaway message.", help="Rerolls a giveaway on replying the giveaway message.")
@@ -335,42 +346,49 @@ class Giveaway(commands.Cog):
     @commands.cooldown(1, 5, commands.BucketType.user)
     @commands.has_guild_permissions(manage_guild=True)
     async def greroll(self, ctx, message_id: typing.Optional[int] = None):
-        if not ctx.message.reference:
-            message = await ctx.reply("Reply this command with the Giveaway Ended message to reroll.")
-            await asyncio.sleep(5)
-            await message.delete()
-            return
+        if ctx.interaction:
+            await ctx.defer()
 
-        if ctx.message.reference:
+        if not ctx.message or not ctx.message.reference:
+            if message_id is None:
+                message = await ctx.send("Reply this command with the Giveaway Ended message to reroll, or provide a message ID.")
+                if not ctx.interaction:
+                    await asyncio.sleep(5)
+                    await message.delete()
+                return
+
+        if ctx.message and ctx.message.reference:
             message_id = ctx.message.reference.resolved.id
 
         message = await ctx.fetch_message(message_id)
 
-        if ctx.message.reference.resolved.author.id != self.bot.user.id :
+        if message.author.id != self.bot.user.id:
             msg = await ctx.send(view=CV2("⚠️ Access Denied", "The giveaway was not found."))
-            await asyncio.sleep(5)
-            await msg.delete()
+            if not ctx.interaction:
+                await asyncio.sleep(5)
+                await msg.delete()
             return
-
 
         await self.cursor.execute(f"SELECT message_id FROM Giveaway WHERE message_id = ?", (message.id,))
         re = await self.cursor.fetchone()
 
         if re is not None:
             msg = await ctx.send(view=CV2("⚠️ Access Denied", "The giveaway is currently running. Please use the `gend` command instead to end the giveaway."))
-            await asyncio.sleep(5)
-            await msg.delete()
+            if not ctx.interaction:
+                await asyncio.sleep(5)
+                await msg.delete()
             return
 
         users = [i.id async for i in message.reactions[0].users()]
-        users.remove(self.bot.user.id)
+        if self.bot.user.id in users:
+            users.remove(self.bot.user.id)
 
         if len(users) < 1:
-            await message.reply(f"No one won the **{re[5]}** giveaway, due to not enough participants.")
+            await ctx.send(f"No one won the giveaway, due to not enough participants.")
             return
 
         winners = random.sample(users, k=1)
-        await message.reply(f" The new winner is "+", ".join(f"<@{i}>" for i in winners)+". Congratulations!")
+        await ctx.send(" The new winner is " + ", ".join(f"<@{i}>" for i in winners) + ". Congratulations!")
         await self.connection.commit()
 
     def convert(self, time):
@@ -395,6 +413,9 @@ class Giveaway(commands.Cog):
     @commands.cooldown(1, 5, commands.BucketType.user)
     @commands.has_guild_permissions(manage_guild=True)
     async def glist(self, ctx):
+        if ctx.interaction:
+            await ctx.defer()
+
         await self.cursor.execute("SELECT prize, ends_at, winners, message_id FROM Giveaway WHERE guild_id = ?", (ctx.guild.id,))
         giveaways = await self.cursor.fetchall()
 
