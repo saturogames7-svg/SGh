@@ -12,7 +12,7 @@ from utils.config import *
 
 # --- Configurable Variables ---
 EMBED_COLOR = 0xFF0000
-TICKET_CHANNEL_IMAGE_URL = "https://cdn.discordapp.com/attachments/1403014653214330951/1403022431303630900/images_2.jpg?ex=68a1e776&is=68a095f6&hm=2c4e74b079fa409410920507bfb55549d485aafa89e194d15ab548eaba684555&"
+TICKET_CHANNEL_IMAGE_URL = "https://cdn.discordapp.com/attachments/1530611685772103750/1530611805926199547/Gemini_Generated_Image_opnjhropnjhropnj.png?ex=6a6634d3&is=6a64e353&hm=c6450bb9d72b189368fcf67702aec5120088ccb8581ffc0ac39a131a7f37eba6&"
 
 # --- Emoji Variables ---
 SUCCESS_EMOJI = TICK
