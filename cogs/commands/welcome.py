@@ -1,17 +1,3 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                                                                  ║
-# ║   ░█▀▀░█▀█░█▀▄░█▀▀░█░█   ░█▀▄░█▀▀░█░█░█▀▀                     ║
-# ║   ░█░░░█░█░█░█░█▀▀░▄▀▄   ░█░█░█▀▀░▀▄▀░▀▀█                     ║
-# ║   ░▀▀▀░▀▀▀░▀▀░░▀▀▀░▀░▀   ░▀▀░░▀▀▀░░▀░░▀▀▀                     ║
-# ║                                                                  ║
-# ║            © 2026 CodeX Devs — All Rights Reserved              ║
-# ║                                                                  ║
-# ║   discord  ──  https://discord.gg/codexdev                      ║
-# ║   youtube  ──  https://youtube.com/@CodeXDevs                   ║
-# ║   github   ──  https://github.com/RayExo                        ║
-# ║                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
 import discord
 from utils.emoji import ICONS_CHANNEL, ICONS_PLUS, TICK, ZTICK
 from discord.ext import commands
@@ -64,18 +50,47 @@ class Welcomer(commands.Cog):
         self.bot = bot
         self.bot.loop.create_task(self._create_table())
 
+    # --- Schema definition: single source of truth for expected columns/types. ---
+    # Whenever a new column needs to be added in a future update, add it HERE
+    # (and nowhere else) - the migration below will take care of adding it to
+    # any database file that was created before this update.
+    SCHEMA = {
+        "guild_id": "INTEGER PRIMARY KEY",
+        "welcome_type": "TEXT",
+        "welcome_message": "TEXT",
+        "channel_id": "INTEGER",
+        "embed_data": "TEXT",
+        "auto_delete_duration": "INTEGER",
+    }
+
     async def _create_table(self):
         async with aiosqlite.connect("db/welcome.db") as db:
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS welcome (
-                guild_id INTEGER PRIMARY KEY,
-                welcome_type TEXT,
-                welcome_message TEXT,
-                channel_id INTEGER,
-                embed_data TEXT,
-                auto_delete_duration INTEGER
-            )
-            """)
+            columns_sql = ", ".join(f"{name} {ctype}" for name, ctype in self.SCHEMA.items())
+            await db.execute(f"CREATE TABLE IF NOT EXISTS welcome ({columns_sql})")
+            await db.commit()
+            await self._migrate_table(db)
+
+    async def _migrate_table(self, db):
+        """
+        Ensures an existing (pre-update) welcome.db has every column defined in
+        SCHEMA. CREATE TABLE IF NOT EXISTS does nothing if the table already
+        exists, so if a new column gets added to SCHEMA in a future update,
+        old guild rows created before that update would be missing it and
+        every query touching that column (or unpacking the full row) would
+        break. This checks the real columns via PRAGMA and ALTERs in any
+        that are missing, so old data keeps working after an update.
+        """
+        async with db.execute("PRAGMA table_info(welcome)") as cursor:
+            existing_columns = {row[1] for row in await cursor.fetchall()}
+
+        missing_columns = [name for name in self.SCHEMA if name not in existing_columns]
+        for name in missing_columns:
+            # PRIMARY KEY columns can't be added via ALTER TABLE, but guild_id
+            # will always exist already since it's part of the original CREATE.
+            col_type = self.SCHEMA[name].replace("PRIMARY KEY", "").strip()
+            await db.execute(f"ALTER TABLE welcome ADD COLUMN {name} {col_type}")
+
+        if missing_columns:
             await db.commit()
 
     @commands.hybrid_group(invoke_without_command=True, name="greet", help="Shows all the greet commands.")
@@ -247,11 +262,23 @@ class Welcomer(commands.Cog):
 
     
     async def _save_welcome_data(self, guild_id, welcome_type, message, embed_data=None):
+        # NOTE: uses UPDATE-if-exists / INSERT-if-not, instead of INSERT OR
+        # REPLACE, so that columns not passed in here (like channel_id or
+        # auto_delete_duration) aren't wiped out if a row already exists.
         async with aiosqlite.connect("db/welcome.db") as db:
-            await db.execute("""
-            INSERT OR REPLACE INTO welcome (guild_id, welcome_type, welcome_message, embed_data)
-            VALUES (?, ?, ?, ?)
-            """, (guild_id, welcome_type, message, json.dumps(embed_data) if embed_data else None))
+            async with db.execute("SELECT 1 FROM welcome WHERE guild_id = ?", (guild_id,)) as cursor:
+                exists = await cursor.fetchone()
+
+            if exists:
+                await db.execute(
+                    "UPDATE welcome SET welcome_type = ?, welcome_message = ?, embed_data = ? WHERE guild_id = ?",
+                    (welcome_type, message, json.dumps(embed_data) if embed_data else None, guild_id)
+                )
+            else:
+                await db.execute(
+                    "INSERT INTO welcome (guild_id, welcome_type, welcome_message, embed_data) VALUES (?, ?, ?, ?)",
+                    (guild_id, welcome_type, message, json.dumps(embed_data) if embed_data else None)
+                )
             await db.commit()
 
     
@@ -946,5 +973,3 @@ class Welcomer(commands.Cog):
             view.add_item(cancel_button)
             
             await ctx.send(embed=embed, view=view)
-
-
