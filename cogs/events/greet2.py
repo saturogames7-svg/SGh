@@ -2,9 +2,9 @@ import discord
 import json
 import re
 import asyncio
+import traceback
 from discord.ext import commands
-from utils.welcome_db import welcome_db
-
+from utils.welcome_db import get_welcome_db
 
 class greet(commands.Cog):
     def __init__(self, bot):
@@ -13,10 +13,14 @@ class greet(commands.Cog):
         self.processing = set()
 
     async def cog_load(self):
-        # Table creation/migration is idempotent, so calling it here too
-        # (Welcomer's cog_load also calls it) is safe regardless of which
-        # of the two cogs happens to load first.
-        await welcome_db.initialize()
+        try:
+            self.db = await get_welcome_db()
+        except Exception:
+            print("=" * 60)
+            print("[greet] FAILED inside cog_load() (Turso table setup):")
+            traceback.print_exc()
+            print("=" * 60)
+            raise
 
     async def safe_format(self, text, placeholders):
         placeholders_lower = {k.lower(): v for k, v in placeholders.items()}
@@ -38,16 +42,19 @@ class greet(commands.Cog):
         try:
             while self.join_queue[guild.id]:
                 member = self.join_queue[guild.id].pop(0)
-
-                row = await welcome_db.get_columns(
-                    ["welcome_type", "welcome_message", "channel_id", "embed_data", "auto_delete_duration"],
-                    guild.id
+                row = await self.db.fetchone(
+                    "SELECT welcome_type, welcome_message, channel_id, embed_data, auto_delete_duration FROM welcome WHERE guild_id = ?",
+                    (guild.id,)
                 )
 
                 if row is None:
                     continue
 
-                welcome_type, welcome_message, channel_id, embed_data, auto_delete_duration = row
+                welcome_type = row['welcome_type']
+                welcome_message = row['welcome_message']
+                channel_id = row['channel_id']
+                embed_data = row['embed_data']
+                auto_delete_duration = row['auto_delete_duration']
                 welcome_channel = self.bot.get_channel(channel_id)
                 if not welcome_channel:
                     continue
@@ -67,7 +74,7 @@ class greet(commands.Cog):
                     "timestamp": discord.utils.format_dt(discord.utils.utcnow())
                 }
 
-                sent_message = None  # قيمة افتراضية عشان مايبقاش undefined لو welcome_type غير معروف
+                sent_message = None
 
                 try:
                     if welcome_type == "simple" and welcome_message:
@@ -123,17 +130,12 @@ class greet(commands.Cog):
                     continue
 
                 except Exception as e:
-                    # أي خطأ تاني غير متوقع (JSON تالف، بيانات ناقصة، الخ)
-                    # يتسجل في اللوج ونكمل للعضو اللي بعده بدل ما نوقف الدالة كلها
                     print(f"[greet] unexpected error while processing member {member.id} in guild {guild.id}: {e}")
                     continue
 
                 await asyncio.sleep(2)
 
         finally:
-            # finally بتضمن إن الجيلد ده دايمًا يتشال من processing
-            # حتى لو حصل استثناء مش متوقع في مكان تاني من الحلقة.
-            # discard بدل remove عشان مايرميش KeyError لو الـ id مش موجود أصلاً.
             self.processing.discard(guild.id)
 
 async def setup(bot):
