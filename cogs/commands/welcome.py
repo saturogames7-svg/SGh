@@ -93,117 +93,6 @@ class Welcomer(commands.Cog):
         if missing_columns:
             await db.commit()
 
-    # ------------------------------------------------------------------
-    # NEW: this is the piece that was missing. Nothing in the old file
-    # ever fired when a real member joined the server - /greet test was
-    # the only way a welcome message ever got sent. This listener wires
-    # the saved config up to the actual join event, and also applies
-    # auto_delete_duration (which was being saved but never used).
-    # ------------------------------------------------------------------
-    def _build_placeholders(self, guild: discord.Guild, member: discord.Member):
-        return {
-            "user": member.mention,
-            "user_avatar": member.avatar.url if member.avatar else member.default_avatar.url,
-            "user_name": member.name,
-            "user_id": member.id,
-            "user_nick": member.display_name,
-            "user_joindate": member.joined_at.strftime("%a, %b %d, %Y") if member.joined_at else "Unknown",
-            "user_createdate": member.created_at.strftime("%a, %b %d, %Y"),
-            "server_name": guild.name,
-            "server_id": guild.id,
-            "server_membercount": guild.member_count,
-            "server_icon": guild.icon.url if guild.icon else "https://cdn.discordapp.com/embed/avatars/0.png",
-            "timestamp": discord.utils.format_dt(discord.utils.utcnow())
-        }
-
-    async def _send_welcome_message(self, guild: discord.Guild, member: discord.Member, row):
-        welcome_type, welcome_message, channel_id, embed_data, auto_delete_duration = row
-        welcome_channel = guild.get_channel(channel_id) if channel_id else None
-        if not welcome_channel:
-            return None
-
-        placeholders = self._build_placeholders(guild, member)
-
-        def safe_format(text):
-            placeholders_lower = {k.lower(): v for k, v in placeholders.items()}
-
-            def replace_var(match):
-                var_name = match.group(1).lower()
-                return str(placeholders_lower.get(var_name, f"{{{var_name}}}"))
-
-            return re.sub(r"\{(\w+)\}", replace_var, text or "")
-
-        sent_message = None
-
-        if welcome_type == "simple" and welcome_message:
-            sent_message = await welcome_channel.send(safe_format(welcome_message))
-
-        elif welcome_type == "embed" and embed_data:
-            try:
-                embed_info = json.loads(embed_data)
-            except (ValueError, json.JSONDecodeError):
-                return None
-
-            color_value = embed_info.get("color", None)
-            embed_color = 0x2f3136
-            if color_value and isinstance(color_value, str) and color_value.startswith("#"):
-                embed_color = discord.Color(int(color_value.lstrip("#"), 16))
-            elif isinstance(color_value, int):
-                embed_color = discord.Color(color_value)
-
-            content = safe_format(embed_info.get("message", "")) or None
-            embed = discord.Embed(
-                title=safe_format(embed_info.get("title", "")),
-                description=safe_format(embed_info.get("description", "")),
-                color=embed_color
-            )
-            embed.timestamp = discord.utils.utcnow()
-
-            if embed_info.get("footer_text"):
-                embed.set_footer(
-                    text=safe_format(embed_info["footer_text"]),
-                    icon_url=safe_format(embed_info.get("footer_icon", ""))
-                )
-            if embed_info.get("author_name"):
-                embed.set_author(
-                    name=safe_format(embed_info["author_name"]),
-                    icon_url=safe_format(embed_info.get("author_icon", ""))
-                )
-            if embed_info.get("thumbnail"):
-                embed.set_thumbnail(url=safe_format(embed_info["thumbnail"]))
-            if embed_info.get("image"):
-                embed.set_image(url=safe_format(embed_info["image"]))
-
-            sent_message = await welcome_channel.send(content=content, embed=embed)
-
-        if sent_message and auto_delete_duration:
-            try:
-                await sent_message.delete(delay=auto_delete_duration)
-            except discord.HTTPException:
-                pass
-
-        return sent_message
-
-    @commands.Cog.listener()
-    async def on_member_join(self, member: discord.Member):
-        guild = member.guild
-        async with aiosqlite.connect("db/welcome.db") as db:
-            async with db.execute(
-                "SELECT welcome_type, welcome_message, channel_id, embed_data, auto_delete_duration FROM welcome WHERE guild_id = ?",
-                (guild.id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-
-        if row is None:
-            return  # No welcome configured for this server, nothing to do.
-
-        try:
-            await self._send_welcome_message(guild, member, row)
-        except discord.Forbidden:
-            pass  # Bot lacks permission to send in the configured channel.
-        except discord.HTTPException:
-            pass
-
     @commands.hybrid_group(invoke_without_command=True, name="greet", help="Shows all the greet commands.")
     @blacklist_check()
     @ignore_check()
@@ -719,7 +608,7 @@ class Welcomer(commands.Cog):
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_test(self, ctx):
         async with aiosqlite.connect("db/welcome.db") as db:
-            async with db.execute("SELECT welcome_type, welcome_message, channel_id, embed_data, auto_delete_duration FROM welcome WHERE guild_id = ?", (ctx.guild.id,)) as cursor:
+            async with db.execute("SELECT welcome_type, welcome_message, channel_id, embed_data FROM welcome WHERE guild_id = ?", (ctx.guild.id,)) as cursor:
                 row = await cursor.fetchone()
 
         if row is None:
@@ -728,15 +617,86 @@ class Welcomer(commands.Cog):
             await ctx.send(embed=error)
             return
 
-        if not ctx.guild.get_channel(row[2]) if row[2] else True:
+        welcome_type, welcome_message, channel_id, embed_data = row
+        welcome_channel = self.bot.get_channel(channel_id)
+
+        if not welcome_channel:
             error2 = discord.Embed(description=f"Welcome channel not set or invalid. Use `{ctx.prefix}greet channel` to set one.", color=0xFF0000)
             error2.set_author(name="Channel not set", icon_url="https://cdn.discordapp.com/emojis/1294218790082711553.png")
             await ctx.send(embed=error2)
             return
 
-        # Reuses the exact same sending logic as the real on_member_join event,
-        # so a test truly reflects what a joining member will see (including auto-delete).
-        await self._send_welcome_message(ctx.guild, ctx.author, row)
+        placeholders = {
+            "user": ctx.author.mention,
+            "user_avatar": ctx.author.avatar.url if ctx.author.avatar else ctx.author.default_avatar.url,
+            "user_name": ctx.author.name,
+            "user_id": ctx.author.id,
+            "user_nick": ctx.author.display_name,
+            "user_joindate": ctx.author.joined_at.strftime("%a, %b %d, %Y"),
+            "user_createdate": ctx.author.created_at.strftime("%a, %b %d, %Y"),
+            "server_name": ctx.guild.name,
+            "server_id": ctx.guild.id,
+            "server_membercount": ctx.guild.member_count,
+            "server_icon": ctx.guild.icon.url if ctx.guild.icon else "https://cdn.discordapp.com/embed/avatars/0.png",
+            "timestamp": discord.utils.format_dt(ctx.message.created_at)
+        }
+
+        def safe_format(text):
+            placeholders_lower = {k.lower(): v for k, v in placeholders.items()}  
+
+            def replace_var(match):
+                var_name = match.group(1).lower()  
+                return str(placeholders_lower.get(var_name, f"{{{var_name}}}"))
+
+            return re.sub(r"\{(\w+)\}", replace_var, text or "")
+            
+
+        if welcome_type == "simple" and welcome_message:
+            await welcome_channel.send(safe_format(welcome_message))
+
+        elif welcome_type == "embed" and embed_data:
+            try:
+                embed_info = json.loads(embed_data) 
+                color_value = embed_info.get("color", None)
+
+                
+                embed_color = 0x2f3136
+
+                
+                if color_value and isinstance(color_value, str) and color_value.startswith("#"):
+                    embed_color = discord.Color(int(color_value.lstrip("#"), 16))
+                elif isinstance(color_value, int): 
+                    embed_color = discord.Color(color_value)
+
+            except (ValueError, SyntaxError, json.JSONDecodeError):
+                await ctx.send("Invalid embed data format. Please reconfigure.")
+                return
+
+            content = safe_format(embed_info.get("message", "")) or None
+            embed = discord.Embed(
+                title=safe_format(embed_info.get("title", "")),
+                description=safe_format(embed_info.get("description", "")),
+                color=embed_color
+            )
+            embed.timestamp = discord.utils.utcnow()
+
+
+            if embed_info.get("footer_text"):
+                embed.set_footer(
+                    text=safe_format(embed_info["footer_text"]),
+                    icon_url=safe_format(embed_info.get("footer_icon", ""))
+                )
+            if embed_info.get("author_name"):
+                embed.set_author(
+                    name=safe_format(embed_info["author_name"]),
+                    icon_url=safe_format(embed_info.get("author_icon", ""))
+                )
+            if embed_info.get("thumbnail"):
+                embed.set_thumbnail(url=safe_format(embed_info["thumbnail"]))
+            if embed_info.get("image"):
+                embed.set_image(url=safe_format(embed_info["image"]))
+
+            await welcome_channel.send(content=content, embed=embed)
 
 
 
@@ -1013,7 +973,3 @@ class Welcomer(commands.Cog):
             view.add_item(cancel_button)
             
             await ctx.send(embed=embed, view=view)
-
-
-async def setup(bot):
-    await bot.add_cog(Welcomer(bot))
