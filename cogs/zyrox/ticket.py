@@ -2,6 +2,7 @@ import discord
 from utils.emoji import TICKET
 from discord.ext import commands
 
+
 class _ticket(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -15,5 +16,5 @@ class _ticket(commands.Cog):
 
     @commands.group()
     async def __Ticket__(self, ctx: commands.Context):
-        """`/ticket setup`, `/ticket category add`, `/ticket category remove`, `/ticket color`, `/ticket close`, `/ticket lock`, `/ticket claim`, `/ticket unlock`, `/ticket transcript`"""
+        """`/ticket setup`, `/ticket panels`, `/ticket category add`, `/ticket category remove`, `/ticket color`, `/ticket close`, `/ticket lock`, `/ticket claim`, `/ticket unlock`, `/ticket transcript`"""
         
