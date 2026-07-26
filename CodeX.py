@@ -73,16 +73,6 @@ async def update_stats():
 async def on_ready():
     await client.wait_until_ready()
     
-    print("""
-        \033[1;31m
- ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗
-██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝
-██║     ██║   ██║██║  ██║█████╗   ╚███╔╝ 
-██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗ 
-╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗
- ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝
-        \033[0m
-       """)
     print("Loaded & Online!")
     print(f"Logged in as: {client.user}")
     print(f"Connected to: {len(client.guilds)} guilds")
