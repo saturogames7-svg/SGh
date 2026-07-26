@@ -1,17 +1,3 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                                                                  ║
-# ║   ░█▀▀░█▀█░█▀▄░█▀▀░█░█   ░█▀▄░█▀▀░█░█░█▀▀                     ║
-# ║   ░█░░░█░█░█░█░█▀▀░▄▀▄   ░█░█░█▀▀░▀▄▀░▀▀█                     ║
-# ║   ░▀▀▀░▀▀▀░▀▀░░▀▀▀░▀░▀   ░▀▀░░▀▀▀░░▀░░▀▀▀                     ║
-# ║                                                                  ║
-# ║            © 2026 CodeX Devs — All Rights Reserved              ║
-# ║                                                                  ║
-# ║   discord  ──  https://discord.gg/codexdev                      ║
-# ║   youtube  ──  https://youtube.com/@CodeXDevs                   ║
-# ║   github   ──  https://github.com/RayExo                        ║
-# ║                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
 import asyncio
 import discord
 from utils.emoji import CROSS, TICK, ZWARNING, ZYROXCONNECTION, ZYROXLINKS
@@ -392,7 +378,7 @@ class General(commands.Cog):
       invite_text = (
           "```Empower your server with blazing-fast features and 24/7 support!```\n"
           f"{ZYROXLINKS} **Quick Actions**\n"
-          f">>> **[Invite {BotName}](https://discord.com/oauth2/authorize?client_id=1396114795102470196&permissions=8&integration_type=0&scope=bot+applications.commands)**\n"
-          "**[Support Server](https://discord.gg/codexdev)**"
+          f">>> **[Invite {BotName}](https://discord.com/oauth2/authorize?client_id=1396547865224155296&permissions=0&integration_type=0&scope=bot+applications.commands)**\n"
+          "**[Support Server](https://discord.gg/G2USDHCK7t)**"
       )
       await ctx.send(view=CV2(f"{ZYROXCONNECTION} {BotName} Integration Hub!", invite_text))
