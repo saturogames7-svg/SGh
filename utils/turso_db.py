@@ -30,6 +30,12 @@ def get_client():
                 "TURSO_DATABASE_URL or TURSO_AUTH_TOKEN is not set. "
                 "Add both in Railway -> Variables before starting the bot."
             )
+        # Force HTTP instead of the websocket (wss://) protocol that
+        # libsql:// triggers - the websocket handshake fails on this host
+        # (WSServerHandshakeError: 400). Doing the swap here means the
+        # Railway variable itself can stay as libsql://... untouched.
+        if url.startswith("libsql://"):
+            url = "https://" + url[len("libsql://"):]
         _client = libsql_client.create_client(url=url, auth_token=token)
     return _client
 
@@ -40,3 +46,4 @@ async def close_client():
     if _client is not None:
         await _client.close()
         _client = None
+        
