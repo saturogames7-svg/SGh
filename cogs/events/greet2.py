@@ -1,17 +1,3 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                                                                  ║
-# ║   ░█▀▀░█▀█░█▀▄░█▀▀░█░█   ░█▀▄░█▀▀░█░█░█▀▀                     ║
-# ║   ░█░░░█░█░█░█░█▀▀░▄▀▄   ░█░█░█▀▀░▀▄▀░▀▀█                     ║
-# ║   ░▀▀▀░▀▀▀░▀▀░░▀▀▀░▀░▀   ░▀▀░░▀▀▀░░▀░░▀▀▀                     ║
-# ║                                                                  ║
-# ║            © 2026 CodeX Devs — All Rights Reserved              ║
-# ║                                                                  ║
-# ║   discord  ──  https://discord.gg/codexdev                      ║
-# ║   youtube  ──  https://youtube.com/@CodeXDevs                   ║
-# ║   github   ──  https://github.com/RayExo                        ║
-# ║                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
 import discord
 import aiosqlite
 import json
@@ -42,74 +28,107 @@ class greet(commands.Cog):
             await self.process_queue(member.guild)
 
     async def process_queue(self, guild):
-        while self.join_queue[guild.id]:
-            member = self.join_queue[guild.id].pop(0)
-            async with aiosqlite.connect("db/welcome.db") as db:
-                async with db.execute("SELECT welcome_type, welcome_message, channel_id, embed_data, auto_delete_duration FROM welcome WHERE guild_id = ?", (guild.id,)) as cursor:
-                    row = await cursor.fetchone()
-            if row is None:
-                continue
-            welcome_type, welcome_message, channel_id, embed_data, auto_delete_duration = row
-            welcome_channel = self.bot.get_channel(channel_id)
-            if not welcome_channel:
-                continue
-            placeholders = {
-                "user": member.mention,
-                "user_avatar": member.avatar.url if member.avatar else member.default_avatar.url,
-                "user_name": member.name,
-                "user_id": member.id,
-                "user_nick": member.display_name,
-                "user_joindate": member.joined_at.strftime("%a, %b %d, %Y"),
-                "user_createdate": member.created_at.strftime("%a, %b %d, %Y"),
-                "server_name": guild.name,
-                "server_id": guild.id,
-                "server_membercount": guild.member_count,
-                "server_icon": guild.icon.url if guild.icon else "https://cdn.discordapp.com/embed/avatars/0.png",
-                "timestamp": discord.utils.format_dt(discord.utils.utcnow())
-            }
-            try:
-                if welcome_type == "simple" and welcome_message:
-                    content = await self.safe_format(welcome_message, placeholders)
-                    sent_message = await welcome_channel.send(content=content)
-                elif welcome_type == "embed" and embed_data:
-                    embed_info = json.loads(embed_data)
-                    color_value = embed_info.get("color", None)
-                    embed_color = 0x2f3136
-                    if color_value and isinstance(color_value, str) and color_value.startswith("#"):
-                        embed_color = discord.Color(int(color_value.lstrip("#"), 16))
-                    elif isinstance(color_value, int):
-                        embed_color = discord.Color(color_value)
-                    content = await self.safe_format(embed_info.get("message", ""), placeholders) or None
-                    embed = discord.Embed(
-                        title=await self.safe_format(embed_info.get("title", ""), placeholders),
-                        description=await self.safe_format(embed_info.get("description", ""), placeholders),
-                        color=embed_color
-                    )
-                    embed.timestamp = discord.utils.utcnow()
-                    if embed_info.get("footer_text"):
-                        embed.set_footer(
-                            text=await self.safe_format(embed_info["footer_text"], placeholders),
-                            icon_url=await self.safe_format(embed_info.get("footer_icon", ""), placeholders)
-                        )
-                    if embed_info.get("author_name"):
-                        embed.set_author(
-                            name=await self.safe_format(embed_info["author_name"], placeholders),
-                            icon_url=await self.safe_format(embed_info.get("author_icon", ""), placeholders)
-                        )
-                    if embed_info.get("thumbnail"):
-                        embed.set_thumbnail(url=await self.safe_format(embed_info["thumbnail"], placeholders))
-                    if embed_info.get("image"):
-                        embed.set_image(url=await self.safe_format(embed_info["image"], placeholders))
-                    sent_message = await welcome_channel.send(content=content, embed=embed)
-                if auto_delete_duration:
-                    await sent_message.delete(delay=auto_delete_duration)
-            except discord.Forbidden:
-                continue
-            except discord.HTTPException as e:
-                if e.code == 50035 or e.status == 429:
-                    await asyncio.sleep(1)
-                    self.join_queue[guild.id].append(member)
-                    continue
-            await asyncio.sleep(2)
-        self.processing.remove(guild.id)
+        try:
+            while self.join_queue[guild.id]:
+                member = self.join_queue[guild.id].pop(0)
+                async with aiosqlite.connect("db/welcome.db") as db:
+                    async with db.execute(
+                        "SELECT welcome_type, welcome_message, channel_id, embed_data, auto_delete_duration FROM welcome WHERE guild_id = ?",
+                        (guild.id,)
+                    ) as cursor:
+                        row = await cursor.fetchone()
 
+                if row is None:
+                    continue
+
+                welcome_type, welcome_message, channel_id, embed_data, auto_delete_duration = row
+                welcome_channel = self.bot.get_channel(channel_id)
+                if not welcome_channel:
+                    continue
+
+                placeholders = {
+                    "user": member.mention,
+                    "user_avatar": member.avatar.url if member.avatar else member.default_avatar.url,
+                    "user_name": member.name,
+                    "user_id": member.id,
+                    "user_nick": member.display_name,
+                    "user_joindate": member.joined_at.strftime("%a, %b %d, %Y"),
+                    "user_createdate": member.created_at.strftime("%a, %b %d, %Y"),
+                    "server_name": guild.name,
+                    "server_id": guild.id,
+                    "server_membercount": guild.member_count,
+                    "server_icon": guild.icon.url if guild.icon else "https://cdn.discordapp.com/embed/avatars/0.png",
+                    "timestamp": discord.utils.format_dt(discord.utils.utcnow())
+                }
+
+                sent_message = None  # قيمة افتراضية عشان مايبقاش undefined لو welcome_type غير معروف
+
+                try:
+                    if welcome_type == "simple" and welcome_message:
+                        content = await self.safe_format(welcome_message, placeholders)
+                        sent_message = await welcome_channel.send(content=content)
+
+                    elif welcome_type == "embed" and embed_data:
+                        embed_info = json.loads(embed_data)
+                        color_value = embed_info.get("color", None)
+                        embed_color = 0x2f3136
+                        if color_value and isinstance(color_value, str) and color_value.startswith("#"):
+                            embed_color = discord.Color(int(color_value.lstrip("#"), 16))
+                        elif isinstance(color_value, int):
+                            embed_color = discord.Color(color_value)
+
+                        content = await self.safe_format(embed_info.get("message", ""), placeholders) or None
+                        embed = discord.Embed(
+                            title=await self.safe_format(embed_info.get("title", ""), placeholders),
+                            description=await self.safe_format(embed_info.get("description", ""), placeholders),
+                            color=embed_color
+                        )
+                        embed.timestamp = discord.utils.utcnow()
+
+                        if embed_info.get("footer_text"):
+                            embed.set_footer(
+                                text=await self.safe_format(embed_info["footer_text"], placeholders),
+                                icon_url=await self.safe_format(embed_info.get("footer_icon", ""), placeholders)
+                            )
+                        if embed_info.get("author_name"):
+                            embed.set_author(
+                                name=await self.safe_format(embed_info["author_name"], placeholders),
+                                icon_url=await self.safe_format(embed_info.get("author_icon", ""), placeholders)
+                            )
+                        if embed_info.get("thumbnail"):
+                            embed.set_thumbnail(url=await self.safe_format(embed_info["thumbnail"], placeholders))
+                        if embed_info.get("image"):
+                            embed.set_image(url=await self.safe_format(embed_info["image"], placeholders))
+
+                        sent_message = await welcome_channel.send(content=content, embed=embed)
+
+                    if sent_message and auto_delete_duration:
+                        await sent_message.delete(delay=auto_delete_duration)
+
+                except discord.Forbidden:
+                    continue
+
+                except discord.HTTPException as e:
+                    if getattr(e, "code", None) == 50035 or getattr(e, "status", None) == 429:
+                        await asyncio.sleep(1)
+                        self.join_queue[guild.id].append(member)
+                        continue
+                    print(f"[greet] HTTPException while sending welcome for guild {guild.id}: {e}")
+                    continue
+
+                except Exception as e:
+                    # أي خطأ تاني غير متوقع (JSON تالف، بيانات ناقصة، الخ)
+                    # يتسجل في اللوج ونكمل للعضو اللي بعده بدل ما نوقف الدالة كلها
+                    print(f"[greet] unexpected error while processing member {member.id} in guild {guild.id}: {e}")
+                    continue
+
+                await asyncio.sleep(2)
+
+        finally:
+            # finally بتضمن إن الجيلد ده دايمًا يتشال من processing
+            # حتى لو حصل استثناء مش متوقع في مكان تاني من الحلقة.
+            # discard بدل remove عشان مايرميش KeyError لو الـ id مش موجود أصلاً.
+            self.processing.discard(guild.id)
+
+async def setup(bot):
+    await bot.add_cog(greet(bot))
