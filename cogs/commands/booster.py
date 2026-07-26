@@ -35,6 +35,14 @@ format ="\x1b[38;5;197m[\x1b[0m%(asctime)s\x1b[38;5;197m]\x1b[0m -> \x1b[38;5;19
 datefmt ="%H:%M:%S",
 )
 
+class SetupCancelled (Exception ):
+    """Raised internally when the user cancels the `boost setup` wizard"""
+    pass 
+
+class SetupTimeout (Exception ):
+    """Raised internally when the user doesn't respond to a `boost setup` prompt in time"""
+    pass 
+
 class Booster (Cog ):
 
     COLOR_MAP = {
@@ -322,6 +330,91 @@ class Booster (Cog ):
         await ctx.send(view=CV2("Permission Error", "```diff\n- You must have Administrator permission.\n- Your top role should be above my top role.\n```"))
 
     # ------------------------------------------------------------------
+    # Setup wizard helpers
+    # ------------------------------------------------------------------
+
+    async def _wait_for_reply (self ,ctx )->str :
+        """Wait for a single reply from the command invoker in the same channel"""
+        def check (m ):
+            return m .author ==ctx .author and m .channel ==ctx .channel 
+
+        try :
+            message =await self .bot .wait_for ('message',check =check ,timeout =60.0 )
+        except asyncio .TimeoutError :
+            return "__TIMEOUT__"
+
+        content =message .content .strip ()
+        if content .lower ()=="cancel":
+            return "__CANCEL__"
+        if content .lower ()=="skip":
+            return "__SKIP__"
+        return content 
+
+    async def _prompt_field (self ,ctx ,step_no :int ,total :int ,title :str ,question :str ,validator :Optional [Callable [[str ],Any ]]=None ,allow_clear :bool =True )->Any :
+        """Ask a single setup wizard question, re-prompting on invalid input.
+        Returns "__SKIP__" if the user skips, the parsed value, or "" if the field was cleared.
+        Raises SetupCancelled / SetupTimeout so the caller can unwind in one place."""
+        while True :
+            prompt_text =f"**Step {step_no}/{total} — {title}**\n{question}\n*Type `skip` to keep the current value, or `cancel` to abort setup.*"
+            await ctx .send (view =CV2 ("Boost Setup",prompt_text ))
+
+            answer =await self ._wait_for_reply (ctx )
+
+            if answer =="__CANCEL__":
+                raise SetupCancelled ()
+            if answer =="__TIMEOUT__":
+                raise SetupTimeout ()
+            if answer =="__SKIP__":
+                return "__SKIP__"
+            if allow_clear and self ._is_clear_value (answer ):
+                return ""
+
+            if validator is not None :
+                result =validator (answer )
+                if result is None :
+                    await ctx .send (view =CV2 ("Error",f"{CROSS} That value isn't valid. Please try again, `skip`, or `cancel`."))
+                    continue 
+                return result 
+
+            return answer 
+
+    def _validate_channels (self ,answer :str ,guild :discord .Guild )->Optional [List [str ]]:
+        """Parse up to 3 channel mentions/IDs out of a setup wizard reply"""
+        channel_ids :List [str ]=[]
+        for word in answer .split ():
+            match =re .search (r"\d{15,20}",word )
+            if match :
+                channel =guild .get_channel (int (match .group ()))
+                if channel and str (channel .id )not in channel_ids :
+                    channel_ids .append (str (channel .id ))
+        if not channel_ids :
+            return None 
+        return channel_ids [:3 ]
+
+    def _validate_url (self ,answer :str )->Optional [str ]:
+        return answer if self .url_pattern .match (answer )else None 
+
+    def _validate_bool (self ,answer :str )->Optional [bool ]:
+        value =answer .strip ().lower ()
+        if value in ("yes","y","true","on","enable","enabled"):
+            return True 
+        if value in ("no","n","false","off","disable","disabled"):
+            return False 
+        return None 
+
+    def _validate_autodel (self ,answer :str )->Optional [int ]:
+        try :
+            value =int (answer .strip ())
+        except ValueError :
+            return None 
+        if value <0 :
+            return None 
+        return value 
+
+    def _validate_max_length (self ,answer :str ,max_len :int )->Optional [str ]:
+        return answer if len (answer )<=max_len else None 
+
+    # ------------------------------------------------------------------
     # Automatic boost detection
     # ------------------------------------------------------------------
 
@@ -389,6 +482,161 @@ class Booster (Cog ):
         if ctx .subcommand_passed is None :
             await ctx .send_help (ctx .command )
             ctx .command .reset_cooldown (ctx )
+
+    @_boost .command (name ="setup",help ="Interactive step-by-step setup wizard for the full boost message system")
+    @blacklist_check ()
+    @ignore_check ()
+    @commands .cooldown (1 ,10 ,commands .BucketType .user )
+    @commands .max_concurrency (1 ,per =commands .BucketType .default ,wait =False )
+    @commands .guild_only ()
+    @commands .has_permissions (administrator =True )
+    async def _boost_setup (self ,ctx ):
+        if not self .is_authorized (ctx ):
+            await self .send_permission_error (ctx )
+            return 
+
+        data =await self .get_boost_config (ctx .guild .id )
+        boost =data ["boost"]
+        total =15 
+
+        await ctx .send (view =CV2 (
+        f"{NITRO_BOOST} Boost Setup Wizard",
+        "I'll walk you through configuring the entire boost message system, one step at a time.\n"
+        "At any step, type `skip` to keep the current value, or `cancel` to stop without saving anything.\n"
+        "You have 60 seconds to answer each question."
+        ))
+
+        try :
+            channels =await self ._prompt_field (
+            ctx ,1 ,total ,"Boost Channel(s)",
+            "Mention up to 3 channels where boost messages should be sent (space separated).",
+            validator =lambda a :self ._validate_channels (a ,ctx .guild ),allow_clear =False 
+            )
+            if channels !="__SKIP__":
+                boost ["channel"]=channels 
+
+            use_embed =await self ._prompt_field (
+            ctx ,2 ,total ,"Embed Mode",
+            "Should boost messages be sent as an embed? Reply `yes` or `no`.",
+            validator =self ._validate_bool ,allow_clear =False 
+            )
+            if use_embed !="__SKIP__":
+                boost ["embed"]=use_embed 
+
+            message =await self ._prompt_field (
+            ctx ,3 ,total ,"Message Content",
+            "Send the boost message text. Variables like {user.mention} and {server.name} are supported.\n"
+            "This is used as the embed description if no custom description is set below, or as the plain message if embeds are off."
+            )
+            if message !="__SKIP__":
+                boost ["message"]=message 
+
+            title =await self ._prompt_field (
+            ctx ,4 ,total ,"Embed Title",
+            "Send a title for the embed (max 256 characters), or `none` to leave it blank.",
+            validator =lambda a :self ._validate_max_length (a ,256 )
+            )
+            if title !="__SKIP__":
+                boost ["title"]=title 
+
+            description =await self ._prompt_field (
+            ctx ,5 ,total ,"Embed Description",
+            "Send a custom description for the embed (max 4096 characters), or `none` to fall back to the message content.",
+            validator =lambda a :self ._validate_max_length (a ,4096 )
+            )
+            if description !="__SKIP__":
+                boost ["description"]=description 
+
+            color =await self ._prompt_field (
+            ctx ,6 ,total ,"Embed Color",
+            "Send a color: a hex code (`#5865F2` or `0x5865F2`), a name (`red`, `green`, `blue`, `orange`, `purple`, `gold`), `random`, or `reset`.",
+            validator =self .parse_color ,allow_clear =False 
+            )
+            if color !="__SKIP__":
+                boost ["color"]=color 
+
+            thumbnail =await self ._prompt_field (
+            ctx ,7 ,total ,"Thumbnail",
+            "Send an image URL to use as the thumbnail, or `none` to remove it.",
+            validator =self ._validate_url 
+            )
+            if thumbnail !="__SKIP__":
+                boost ["thumbnail"]=thumbnail 
+
+            image =await self ._prompt_field (
+            ctx ,8 ,total ,"Image",
+            "Send an image URL to use as the embed image, or `none` to remove it.",
+            validator =self ._validate_url 
+            )
+            if image !="__SKIP__":
+                boost ["image"]=image 
+
+            footer =await self ._prompt_field (
+            ctx ,9 ,total ,"Footer Text",
+            "Send footer text for the embed (max 2048 characters), or `none` to remove it.",
+            validator =lambda a :self ._validate_max_length (a ,2048 )
+            )
+            if footer !="__SKIP__":
+                boost ["footer"]=footer 
+
+            footericon =await self ._prompt_field (
+            ctx ,10 ,total ,"Footer Icon",
+            "Send an image URL for the footer icon, or `none` to remove it.",
+            validator =self ._validate_url 
+            )
+            if footericon !="__SKIP__":
+                boost ["footericon"]=footericon 
+
+            author =await self ._prompt_field (
+            ctx ,11 ,total ,"Author Name",
+            "Send a name to show in the embed author field (max 256 characters), or `none` to remove it.",
+            validator =lambda a :self ._validate_max_length (a ,256 )
+            )
+            if author !="__SKIP__":
+                boost ["author"]=author 
+
+            authoricon =await self ._prompt_field (
+            ctx ,12 ,total ,"Author Icon",
+            "Send an image URL for the author icon, or `none` to remove it.",
+            validator =self ._validate_url 
+            )
+            if authoricon !="__SKIP__":
+                boost ["authoricon"]=authoricon 
+
+            ping =await self ._prompt_field (
+            ctx ,13 ,total ,"Ping Booster",
+            "Should the booster be pinged when the message is sent? Reply `yes` or `no`.",
+            validator =self ._validate_bool ,allow_clear =False 
+            )
+            if ping !="__SKIP__":
+                boost ["ping"]=ping 
+
+            timestamp =await self ._prompt_field (
+            ctx ,14 ,total ,"Timestamp",
+            "Should the embed show a timestamp? Reply `yes` or `no`.",
+            validator =self ._validate_bool ,allow_clear =False 
+            )
+            if timestamp !="__SKIP__":
+                boost ["timestamp"]=timestamp 
+
+            autodel =await self ._prompt_field (
+            ctx ,15 ,total ,"Auto-delete",
+            "Send how many seconds boost messages should stay before being auto-deleted, or `0` to disable.",
+            validator =self ._validate_autodel ,allow_clear =False 
+            )
+            if autodel !="__SKIP__":
+                boost ["autodel"]=autodel 
+
+        except SetupCancelled :
+            await ctx .send (view =CV2 ("Cancelled",f"{CROSS} Setup cancelled. No changes were saved."))
+            return 
+        except SetupTimeout :
+            await ctx .send (view =CV2 ("Timeout",f"{TIMER} Setup timed out. No changes were saved."))
+            return 
+
+        await self .update_boost_config (ctx .guild .id ,data )
+
+        await ctx .send (view =CV2 (f"{TICK} Boost Setup Complete","Your boost message system has been fully configured. Use `boost preview` to see it, or `boost config` to review every setting."))
 
     @_boost .command (name ="thumbnail",help ="Set boost message thumbnail")
     @blacklist_check ()
@@ -1082,4 +1330,3 @@ class Booster (Cog ):
 
 async def setup (bot ):
     await bot .add_cog (Booster(bot ))
-    
