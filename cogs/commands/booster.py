@@ -1,9 +1,9 @@
 from __future__ import annotations 
+import traceback
 import discord 
 from utils.emoji import CROSS, NITRO_BOOST, TICK, TIMER
 import asyncio 
 import logging 
-import aiosqlite 
 import json 
 import random
 from discord .ext import commands 
@@ -18,6 +18,7 @@ from time import strftime
 from core import Cog ,zyrox ,Context 
 from discord.ui import LayoutView, TextDisplay, Separator, Container
 from utils.cv2 import CV2, build_container
+from utils.turso_db import get_client
 
 class CV2(LayoutView):
     def __init__(self, title, *sections):
@@ -43,6 +44,57 @@ class SetupTimeout (Exception ):
     """Raised internally when the user doesn't respond to a `boost setup` prompt in time"""
     pass 
 
+
+# --- Database Class (Turso) ---
+# NOTE: this used to be a local aiosqlite file (db/boost.db). On Railway
+# (and most container hosts) the filesystem is ephemeral - it gets wiped
+# on every redeploy/restart, silently resetting every guild's boost
+# config. Moving this to the shared Turso client (same one ticket.py and
+# autorole.py use) makes it persistent across restarts and deploys.
+class BoostDatabase:
+    SCHEMA = {
+        "guild_id": "INTEGER PRIMARY KEY",
+        "config": "TEXT NOT NULL",
+    }
+
+    def __init__(self):
+        # get_client() only returns the shared client reference - safe to
+        # call from a plain sync __init__ (same reasoning as other cogs).
+        self.client = get_client()
+
+    async def init(self):
+        cols = ", ".join(f"{n} {t}" for n, t in self.SCHEMA.items())
+        await self.client.execute(f"CREATE TABLE IF NOT EXISTS boost_config ({cols})")
+        await self._migrate()
+
+    async def _migrate(self):
+        result = await self.client.execute("PRAGMA table_info(boost_config)")
+        existing_columns = {row[1] for row in result.rows}
+        missing_columns = [name for name in self.SCHEMA if name not in existing_columns]
+        for name in missing_columns:
+            col_type = self.SCHEMA[name].replace("PRIMARY KEY", "").replace("NOT NULL", "").strip()
+            await self.client.execute(f"ALTER TABLE boost_config ADD COLUMN {name} {col_type}")
+
+    @staticmethod
+    def _row_to_dict(columns, row):
+        return {col: row[i] for i, col in enumerate(columns)}
+
+    async def execute(self, q, p=()):
+        return await self.client.execute(q, list(p))
+
+    async def fetchone(self, q, p=()):
+        result = await self.client.execute(q, list(p))
+        if not result.rows:
+            return None
+        return self._row_to_dict(result.columns, result.rows[0])
+
+
+# module-level, lazy - same reasoning as the other cogs sharing the Turso
+# client: get_client() needs a running event loop, so it can't be
+# constructed at plain import time.
+db = None
+
+
 class Booster (Cog ):
 
     COLOR_MAP = {
@@ -57,8 +109,6 @@ class Booster (Cog ):
     def __init__ (self ,bot : Zyrox ):
         self .bot =bot 
         self .color =0xFF0000 
-        self .db_path ="db/boost.db"
-        self .bot .loop .create_task (self .setup_database ())
 
 
         self .url_pattern =re .compile (
@@ -70,18 +120,19 @@ class Booster (Cog ):
         r'(?:/?|[/?]\S+)$',re .IGNORECASE 
         )
 
-
- 
-    async def setup_database (self ):
-        """Initialize boost database tables"""
-        async with aiosqlite .connect (self .db_path )as db :
-            await db .execute ("""
-                CREATE TABLE IF NOT EXISTS boost_config (
-                    guild_id INTEGER PRIMARY KEY,
-                    config TEXT NOT NULL
-                )
-            """)
-            await db .commit ()
+    async def cog_load(self):
+        global db
+        try:
+            if db is None:
+                db = BoostDatabase()
+            await db.init()
+        except Exception:
+            print("=" * 60)
+            print("[Boost] FAILED inside cog_load() (Turso table setup):")
+            traceback.print_exc()
+            print("=" * 60)
+            raise
+        self.db = db
 
     def _default_config (self )->dict :
         """Return a fresh copy of the default boost configuration"""
@@ -122,28 +173,25 @@ class Booster (Cog ):
         """Get boost configuration for a guild, upgrading it with any missing fields"""
         default_config =self ._default_config ()
 
-        async with aiosqlite .connect (self .db_path )as db :
-            async with db .execute ("SELECT config FROM boost_config WHERE guild_id = ?",(guild_id ,))as cursor :
-                row =await cursor .fetchone ()
+        row = await self.db.fetchone("SELECT config FROM boost_config WHERE guild_id = ?", (guild_id,))
 
-                if row :
-                    existing =json .loads (row [0 ])
-                    merged =self ._merge_config (default_config ,existing )
-                    if merged !=existing :
-                        await self .update_boost_config (guild_id ,merged )
-                    return merged 
+        if row :
+            existing =json .loads (row ["config"] )
+            merged =self ._merge_config (default_config ,existing )
+            if merged !=existing :
+                await self .update_boost_config (guild_id ,merged )
+            return merged 
 
-                await self .update_boost_config (guild_id ,default_config )
-                return default_config 
+        await self .update_boost_config (guild_id ,default_config )
+        return default_config 
 
     async def update_boost_config (self ,guild_id :int ,config :dict ):
         """Update boost configuration for a guild"""
-        async with aiosqlite .connect (self .db_path )as db :
-            await db .execute (
-            "INSERT OR REPLACE INTO boost_config (guild_id, config) VALUES (?, ?)",
-            (guild_id ,json .dumps (config ))
-            )
-            await db .commit ()
+        await self.db.execute(
+            "INSERT INTO boost_config (guild_id, config) VALUES (?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET config=excluded.config",
+            (guild_id, json.dumps(config))
+        )
 
     def is_authorized (self ,ctx )->bool :
         """Check if user is authorized to use admin commands"""
@@ -1333,3 +1381,4 @@ class Booster (Cog ):
 
 async def setup (bot ):
     await bot .add_cog (Booster(bot ))
+    
