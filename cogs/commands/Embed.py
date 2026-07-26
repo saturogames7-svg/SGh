@@ -1,17 +1,3 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                                                                  ║
-# ║   ░█▀▀░█▀█░█▀▄░█▀▀░█░█   ░█▀▄░█▀▀░█░█░█▀▀                     ║
-# ║   ░█░░░█░█░█░█░█▀▀░▄▀▄   ░█░█░█▀▀░▀▄▀░▀▀█                     ║
-# ║   ░▀▀▀░▀▀▀░▀▀░░▀▀▀░▀░▀   ░▀▀░░▀▀▀░░▀░░▀▀▀                     ║
-# ║                                                                  ║
-# ║            © 2026 CodeX Devs — All Rights Reserved              ║
-# ║                                                                  ║
-# ║   discord  ──  https://discord.gg/codexdev                      ║
-# ║   youtube  ──  https://youtube.com/@CodeXDevs                   ║
-# ║   github   ──  https://github.com/RayExo                        ║
-# ║                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
 import os
 import discord
 from utils.emoji import CROSS, TICK
@@ -86,6 +72,8 @@ class EmbedBuilder(ui.LayoutView):
                 discord.SelectOption(label="Title", description="Edit the title"),
                 discord.SelectOption(label="Description", description="Edit the description"),
                 discord.SelectOption(label="Add Field", description="Add a field"),
+                discord.SelectOption(label="Edit Field", description="Edit an existing field"),
+                discord.SelectOption(label="Remove Field", description="Remove an existing field"),
                 discord.SelectOption(label="Color", description="Edit the color (hex)"),
                 discord.SelectOption(label="Thumbnail", description="Set thumbnail URL"),
                 discord.SelectOption(label="Image", description="Set image URL"),
@@ -125,6 +113,10 @@ class EmbedBuilder(ui.LayoutView):
             embed.add_field(name=field["name"], value=field["value"], inline=False)
         return embed
 
+    def _fields_list_text(self):
+        """Numbered list of current fields, used when asking the user to pick one."""
+        return "\n".join(f"`{i+1}.` **{f['name']}** — {f['value']}" for i, f in enumerate(self.embed_data["fields"]))
+
     async def _select_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.ctx.author.id:
             await interaction.response.send_message("This builder doesn't belong to you.", ephemeral=True)
@@ -135,6 +127,51 @@ class EmbedBuilder(ui.LayoutView):
 
         def chk(m):
             return m.channel.id == self.ctx.channel.id and m.author.id == self.ctx.author.id
+
+        # --- Edit Field / Remove Field need the list of existing fields up front,
+        # so they're handled separately from the generic single-prompt flow below.
+        if value in ("Edit Field", "Remove Field"):
+            if not self.embed_data["fields"]:
+                await self.ctx.send("There are no fields yet to " + ("edit." if value == "Edit Field" else "remove."))
+                return
+
+            action_word = "edit" if value == "Edit Field" else "remove"
+            await self.ctx.send(f"Which field number do you want to {action_word}?\n{self._fields_list_text()}")
+
+            try:
+                idx_msg = await self.ctx.bot.wait_for("message", timeout=30, check=chk)
+                idx = int(idx_msg.content.strip()) - 1
+                if not (0 <= idx < len(self.embed_data["fields"])):
+                    await self.ctx.send("That's not a valid field number.")
+                    return
+            except ValueError:
+                await self.ctx.send("That's not a valid field number.")
+                return
+            except asyncio.TimeoutError:
+                await self.ctx.send("Timed Out.")
+                return
+
+            if value == "Remove Field":
+                removed = self.embed_data["fields"].pop(idx)
+                await self.ctx.send(f"Removed field **{removed['name']}**.")
+            else:
+                await self.ctx.send("Enter the new **Field title**:")
+                try:
+                    name_msg = await self.ctx.bot.wait_for("message", timeout=30, check=chk)
+                except asyncio.TimeoutError:
+                    await self.ctx.send("Timed Out.")
+                    return
+                await self.ctx.send("Enter the new **Field value**:")
+                try:
+                    val_msg = await self.ctx.bot.wait_for("message", timeout=30, check=chk)
+                except asyncio.TimeoutError:
+                    await self.ctx.send("Timed Out.")
+                    return
+                self.embed_data["fields"][idx] = {"name": name_msg.content, "value": val_msg.content}
+
+            self._build_view()
+            await self.message.edit(view=self)
+            return
 
         prompts = {
             "Title": "Enter the **Title** of the embed:",
