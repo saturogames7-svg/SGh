@@ -93,3 +93,8 @@ class WelcomeDB:
 
 # Shared singleton - both greet2.py and welcome.py import this same instance.
 welcome_db = WelcomeDB()
+
+
+
+# Shared singleton - both greet2.py and welcome.py import this same instance.
+welcome_db = WelcomeDB()
