@@ -58,7 +58,19 @@ class ReactionRoles(commands.Cog):
 
     @commands.hybrid_command(name="createrr", help="Create a reaction role.", usage="createrr <channel> <message_id> <emoji> <role>")
     @commands.has_permissions(manage_roles=True)
-    async def createrr(self, ctx: Context, channel: discord.TextChannel, message_id: int, emoji: str, role: discord.Role):
+    async def createrr(self, ctx: Context, channel: discord.TextChannel, message_id: str, emoji: str, role: discord.Role):
+        # message_id is taken as str, not int: Discord's slash command
+        # INTEGER option type is capped around 2^53 (JS safe integer range),
+        # but message snowflakes can exceed that - the Discord client UI
+        # rejects valid IDs with "Input a valid integer" before the command
+        # even reaches the bot. Taking it as text and converting here avoids
+        # that client-side limit entirely.
+        try:
+            message_id = int(message_id)
+        except ValueError:
+            await ctx.send(f"{CROSS} That doesn't look like a valid message ID.", ephemeral=True if ctx.interaction else False)
+            return
+
         try:
             message = await channel.fetch_message(message_id)
             await message.add_reaction(emoji)
@@ -126,4 +138,3 @@ class ReactionRoles(commands.Cog):
 # Setup
 async def setup(bot):
     await bot.add_cog(ReactionRoles(bot))
-    
