@@ -2,13 +2,14 @@ import discord
 from utils.emoji import CROSS, DELETE_ALT1, HANDSHAKE, LOCK, TICK, UNLOCK, ZBAN, ZMODULE, ZWRENCH
 from discord import app_commands
 from discord.ext import commands
-import sqlite3
+from discord.ext.commands import Context
+import traceback
 from datetime import datetime
 import asyncio
 import io
-import os
 import re
 from utils.config import *
+from utils.turso_db import get_client
 
 # --- Configurable Variables ---
 EMBED_COLOR = 0xFF0000
@@ -26,67 +27,145 @@ REOPEN_EMOJI = ZWRENCH
 TRANSCRIPT_EMOJI = ZMODULE
 
 # --- Constants ---
-if not os.path.exists('db'):
-    os.makedirs('db')
-DB_PATH = 'db/ticket.db'
 MAX_CATEGORIES = 15
 TICKET_LIMIT_PER_USER = 3
 
-# --- Database Class ---
+
+# --- Database Class (Turso) ---
 class TicketDatabase:
-    def __init__(self, path):
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self._create_tables()
+    # Single source of truth for expected columns/types per table.
+    # Adding a column later: add it HERE only, _migrate() adds it to
+    # any pre-existing remote table automatically.
+    GUILD_CONFIGS_SCHEMA = {
+        "guild_id": "INTEGER PRIMARY KEY",
+        "panel_channel_id": "INTEGER",
+        "logging_channel_id": "INTEGER",
+        "panel_message_id": "INTEGER",
+        "panel_type": "TEXT",
+        "embed_title": "TEXT",
+        "embed_description": "TEXT",
+        "embed_color": "INTEGER",
+        "embed_image_url": "TEXT",
+        "embed_thumbnail_url": "TEXT",
+        "closed_category_id": "INTEGER",
+    }
+    TICKET_CATEGORIES_SCHEMA = {
+        "category_id": "INTEGER PRIMARY KEY AUTOINCREMENT",
+        "guild_id": "INTEGER",
+        "name": "TEXT NOT NULL",
+        "emoji": "TEXT",
+        "notified_roles": "TEXT",
+        "button_style": "INTEGER",
+        "discord_category_id": "INTEGER",
+    }
+    OPEN_TICKETS_SCHEMA = {
+        "channel_id": "INTEGER PRIMARY KEY",
+        "ticket_number": "INTEGER",
+        "guild_id": "INTEGER",
+        "creator_id": "INTEGER NOT NULL",
+        "category_db_id": "INTEGER",
+        "created_at": "TEXT NOT NULL",
+        "closed_by_id": "INTEGER",
+        "closed_at": "TEXT",
+        "is_locked": "BOOLEAN DEFAULT 0",
+        "is_claimed": "BOOLEAN DEFAULT 0",
+        "claimed_by_id": "INTEGER",
+        "action_message_id": "INTEGER",
+    }
 
-    def _create_tables(self):
-        with self.conn:
-            self.conn.execute("CREATE TABLE IF NOT EXISTS guild_configs (guild_id INTEGER PRIMARY KEY, panel_channel_id INTEGER, logging_channel_id INTEGER, panel_message_id INTEGER, panel_type TEXT, embed_title TEXT, embed_description TEXT, embed_color INTEGER, embed_image_url TEXT, embed_thumbnail_url TEXT, closed_category_id INTEGER)")
-            self.conn.execute("CREATE TABLE IF NOT EXISTS ticket_categories (category_id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, name TEXT NOT NULL, emoji TEXT, notified_roles TEXT, button_style INTEGER, discord_category_id INTEGER, FOREIGN KEY (guild_id) REFERENCES guild_configs(guild_id) ON DELETE CASCADE)")
-            self.conn.execute("CREATE TABLE IF NOT EXISTS open_tickets (channel_id INTEGER PRIMARY KEY, ticket_number INTEGER, guild_id INTEGER, creator_id INTEGER NOT NULL, category_db_id INTEGER, created_at TEXT NOT NULL, closed_by_id INTEGER, closed_at TEXT, is_locked BOOLEAN DEFAULT FALSE, is_claimed BOOLEAN DEFAULT FALSE, claimed_by_id INTEGER, action_message_id INTEGER, FOREIGN KEY (guild_id) REFERENCES guild_configs(guild_id) ON DELETE CASCADE, FOREIGN KEY (category_db_id) REFERENCES ticket_categories(category_id) ON DELETE SET NULL)")
-            self.conn.execute("CREATE TABLE IF NOT EXISTS user_ticket_counts (guild_id INTEGER, user_id INTEGER, ticket_count INTEGER DEFAULT 0, PRIMARY KEY (guild_id, user_id))")
-            # Safe migration for databases created before action_message_id existed.
-            try:
-                self.conn.execute("ALTER TABLE open_tickets ADD COLUMN action_message_id INTEGER")
-            except sqlite3.OperationalError:
-                pass
+    def __init__(self):
+        # get_client() only returns the shared client reference - safe to
+        # call from a plain sync __init__ (same reasoning as DropdownRoles).
+        self.client = get_client()
 
-    def execute(self, q, p=()):
-        with self.conn: return self.conn.execute(q, p)
-    def fetchone(self, q, p=()):
-        cur = self.conn.cursor(); cur.execute(q, p); return cur.fetchone()
-    def fetchall(self, q, p=()):
-        cur = self.conn.cursor(); cur.execute(q, p); return cur.fetchall()
-    def close(self):
-        if self.conn: self.conn.close()
+    async def init(self):
+        guild_cols = ", ".join(f"{n} {t}" for n, t in self.GUILD_CONFIGS_SCHEMA.items())
+        await self.client.execute(f"CREATE TABLE IF NOT EXISTS guild_configs ({guild_cols})")
+
+        cat_cols = ", ".join(f"{n} {t}" for n, t in self.TICKET_CATEGORIES_SCHEMA.items())
+        await self.client.execute(f"CREATE TABLE IF NOT EXISTS ticket_categories ({cat_cols})")
+
+        open_cols = ", ".join(f"{n} {t}" for n, t in self.OPEN_TICKETS_SCHEMA.items())
+        await self.client.execute(f"CREATE TABLE IF NOT EXISTS open_tickets ({open_cols})")
+
+        # Composite PK table - handled separately from the generic schema
+        # dicts above since _migrate()/PRAGMA logic assumes a simple table.
+        await self.client.execute(
+            "CREATE TABLE IF NOT EXISTS user_ticket_counts ("
+            "guild_id INTEGER, user_id INTEGER, ticket_count INTEGER DEFAULT 0, "
+            "PRIMARY KEY (guild_id, user_id))"
+        )
+
+        await self._migrate("guild_configs", self.GUILD_CONFIGS_SCHEMA)
+        await self._migrate("ticket_categories", self.TICKET_CATEGORIES_SCHEMA)
+        await self._migrate("open_tickets", self.OPEN_TICKETS_SCHEMA)
+
+    async def _migrate(self, table_name, schema):
+        result = await self.client.execute(f"PRAGMA table_info({table_name})")
+        existing_columns = {row[1] for row in result.rows}
+        missing_columns = [name for name in schema if name not in existing_columns]
+        for name in missing_columns:
+            col_type = schema[name].replace("PRIMARY KEY", "").replace("AUTOINCREMENT", "").strip()
+            await self.client.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {col_type}")
+
+    @staticmethod
+    def _row_to_dict(columns, row):
+        return {col: row[i] for i, col in enumerate(columns)}
+
+    async def execute(self, q, p=()):
+        return await self.client.execute(q, list(p))
+
+    async def fetchone(self, q, p=()):
+        result = await self.client.execute(q, list(p))
+        if not result.rows:
+            return None
+        return self._row_to_dict(result.columns, result.rows[0])
+
+    async def fetchall(self, q, p=()):
+        result = await self.client.execute(q, list(p))
+        return [self._row_to_dict(result.columns, row) for row in result.rows]
+
 
 # --- Utility Functions ---
 async def get_or_create_log_channel(db, guild):
-    config = db.fetchone("SELECT logging_channel_id FROM guild_configs WHERE guild_id = ?", (guild.id,))
-    if config and config["logging_channel_id"] and (ch := guild.get_channel(config["logging_channel_id"])): return ch
+    config = await db.fetchone("SELECT logging_channel_id FROM guild_configs WHERE guild_id = ?", (guild.id,))
+    if config and config["logging_channel_id"] and (ch := guild.get_channel(config["logging_channel_id"])):
+        return ch
     overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
     try:
         ch = await guild.create_text_channel(f"{BRAND_NAME}-ticket-logs", overwrites=overwrites)
-        db.execute("INSERT INTO guild_configs (guild_id, logging_channel_id) VALUES (?,?) ON CONFLICT(guild_id) DO UPDATE SET logging_channel_id=excluded.logging_channel_id", (guild.id, ch.id))
+        await db.execute(
+            "INSERT INTO guild_configs (guild_id, logging_channel_id) VALUES (?,?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET logging_channel_id=excluded.logging_channel_id",
+            (guild.id, ch.id)
+        )
         return ch
-    except: return None
+    except Exception:
+        return None
+
 
 async def log_ticket_action(db, guild, user, action, details):
     if log_channel := await get_or_create_log_channel(db, guild):
         embed = discord.Embed(title=f"Ticket Action: {action}", color=EMBED_COLOR, timestamp=datetime.now())
         embed.add_field(name="Action By", value=user.mention).add_field(name="Details", value=details, inline=False)
-        try: await log_channel.send(embed=embed)
-        except: pass
+        try:
+            await log_channel.send(embed=embed)
+        except Exception:
+            pass
+
 
 async def get_or_create_closed_category(db, guild):
-    config = db.fetchone("SELECT closed_category_id FROM guild_configs WHERE guild_id = ?", (guild.id,))
-    if config and config["closed_category_id"] and (cat := guild.get_channel(config["closed_category_id"])): return cat
+    config = await db.fetchone("SELECT closed_category_id FROM guild_configs WHERE guild_id = ?", (guild.id,))
+    if config and config["closed_category_id"] and (cat := guild.get_channel(config["closed_category_id"])):
+        return cat
     overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
     try:
         cat = await guild.create_category("Closed Tickets", overwrites=overwrites)
-        db.execute("UPDATE guild_configs SET closed_category_id = ? WHERE guild_id = ?", (cat.id, guild.id))
+        await db.execute("UPDATE guild_configs SET closed_category_id = ? WHERE guild_id = ?", (cat.id, guild.id))
         return cat
-    except: return None
+    except Exception:
+        return None
+
 
 def resolve_existing_category(guild, raw_input):
     """Try to resolve a user-typed string (ID or name) to an existing discord.CategoryChannel."""
@@ -95,12 +174,15 @@ def resolve_existing_category(guild, raw_input):
     if raw_input.isdigit():
         found = guild.get_channel(int(raw_input))
     if not found:
-        # allow "#123456789012345" style copy-paste mistakes and plain names
         cleaned = raw_input.lstrip('#')
-        found = discord.utils.find(lambda c: c.name.lower() == raw_input.lower() or c.name.lower() == cleaned.lower(), guild.categories)
+        found = discord.utils.find(
+            lambda c: c.name.lower() == raw_input.lower() or c.name.lower() == cleaned.lower(),
+            guild.categories
+        )
     if found and isinstance(found, discord.CategoryChannel):
         return found
     return None
+
 
 # --- Setup Views ---
 class EmbedEditorView(discord.ui.View):
@@ -125,9 +207,10 @@ class EmbedEditorView(discord.ui.View):
         try:
             msg = await self.cog.bot.wait_for("message", check=lambda m: m.author.id == self.ctx.author.id and m.channel.id == self.ctx.channel.id, timeout=120)
             try: await msg.delete()
-            except: pass
+            except Exception: pass
             return msg.content
-        except: return None
+        except Exception:
+            return None
 
     @discord.ui.button(label="Title", style=discord.ButtonStyle.green, row=0)
     async def edit_title(self, inter, button):
@@ -168,20 +251,29 @@ class EmbedEditorView(discord.ui.View):
         await inter.response.defer()
         for item in self.children: item.disabled = True
         try: await self.message.edit(view=self)
-        except: pass
-        self.cog.db.execute("INSERT INTO guild_configs (guild_id, panel_channel_id, panel_type, embed_title, embed_description, embed_color, embed_image_url, embed_thumbnail_url) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET panel_channel_id=excluded.panel_channel_id, panel_type=excluded.panel_type, embed_title=excluded.embed_title, embed_description=excluded.embed_description, embed_color=excluded.embed_color, embed_image_url=excluded.embed_image_url, embed_thumbnail_url=excluded.embed_thumbnail_url", (self.ctx.guild.id, self.panel_channel.id, self.panel_type, self.embed_data["title"], self.embed_data["description"], self.embed_data["color"], self.embed_data.get("image",{}).get("url"), self.embed_data.get("thumbnail",{}).get("url")))
+        except Exception: pass
+        await self.cog.db.execute(
+            "INSERT INTO guild_configs (guild_id, panel_channel_id, panel_type, embed_title, embed_description, embed_color, embed_image_url, embed_thumbnail_url) "
+            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET "
+            "panel_channel_id=excluded.panel_channel_id, panel_type=excluded.panel_type, embed_title=excluded.embed_title, "
+            "embed_description=excluded.embed_description, embed_color=excluded.embed_color, "
+            "embed_image_url=excluded.embed_image_url, embed_thumbnail_url=excluded.embed_thumbnail_url",
+            (self.ctx.guild.id, self.panel_channel.id, self.panel_type, self.embed_data["title"], self.embed_data["description"],
+             self.embed_data["color"], self.embed_data.get("image", {}).get("url"), self.embed_data.get("thumbnail", {}).get("url"))
+        )
         await CategoryConfigView(self.cog, self.ctx).start(inter)
         self.stop()
+
 
 class CategoryConfigView(discord.ui.View):
     def __init__(self, cog, ctx):
         super().__init__(timeout=900)
         self.cog, self.ctx, self.message, self.categories = cog, ctx, None, []
-        self._setup_buttons()
-
-    def _setup_buttons(self):
-        panel_type = self.cog.db.fetchone("SELECT panel_type FROM guild_configs WHERE guild_id=?", (self.ctx.guild.id,))['panel_type']
-        self.add_item(discord.ui.Button(label=f"Add Category", style=discord.ButtonStyle.success, custom_id="add_cat"))
+        # NOTE: previously this called a sync _setup_buttons() that ran a DB
+        # query (panel_type) whose result was never actually used anywhere.
+        # That query is what caused __init__ to try doing network I/O
+        # synchronously - removed entirely, no functional change.
+        self.add_item(discord.ui.Button(label="Add Category", style=discord.ButtonStyle.success, custom_id="add_cat"))
         self.remove_select = discord.ui.Select(placeholder="Select a category to remove...", custom_id="remove_cat")
         self.add_item(self.remove_select)
         self.add_item(discord.ui.Button(label="Finish Setup", style=discord.ButtonStyle.primary, custom_id="finish_setup", row=2))
@@ -241,13 +333,9 @@ class CategoryConfigView(discord.ui.View):
 
         role_ids = []
         if role_input.lower() != 'none':
-            role_mentions = re.findall(r'<@&(\d+)>', role_input)
-            for role_id_str in role_mentions:
+            for role_id_str in re.findall(r'<@&(\d+)>', role_input):
                 role_ids.append(int(role_id_str))
 
-        # --- NEW: let the user point this ticket type at an EXISTING Discord category ---
-        # so multiple ticket types (e.g. 3 categories) can share the same Discord category,
-        # instead of the bot always creating a brand-new one.
         existing_cat_input = await self._prompt(
             inter,
             "If you want this ticket type's channels to go inside an **existing** Discord category, "
@@ -292,45 +380,73 @@ class CategoryConfigView(discord.ui.View):
         if not self.categories: return await inter.response.send_message("Add at least one category.", ephemeral=True)
         await inter.response.defer()
         db, guild_id = self.cog.db, self.ctx.guild.id
-        db.execute("DELETE FROM ticket_categories WHERE guild_id = ?", (guild_id,))
+        await db.execute("DELETE FROM ticket_categories WHERE guild_id = ?", (guild_id,))
         for cat in self.categories:
-            # If the user pointed this ticket type at an existing Discord category, reuse it.
-            # Otherwise create a brand-new one, same as before.
             existing_id = cat.get("existing_category_id")
             cat_ch = self.ctx.guild.get_channel(existing_id) if existing_id else None
             if not cat_ch:
                 try:
                     cat_ch = await self.ctx.guild.create_category(f"{cat['name']} Tickets", overwrites={self.ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False)})
-                except: return await inter.followup.send(f"Can't create category for `{cat['name']}`.", ephemeral=True)
-            db.execute('INSERT INTO ticket_categories (guild_id, name, emoji, notified_roles, button_style, discord_category_id) VALUES (?,?,?,?,?,?)', (guild_id,cat['name'],cat['emoji'],cat['notified_roles'],cat['button_style'],cat_ch.id))
-        config = db.fetchone("SELECT * FROM guild_configs WHERE guild_id=?", (guild_id,))
+                except Exception:
+                    return await inter.followup.send(f"Can't create category for `{cat['name']}`.", ephemeral=True)
+            await db.execute(
+                'INSERT INTO ticket_categories (guild_id, name, emoji, notified_roles, button_style, discord_category_id) VALUES (?,?,?,?,?,?)',
+                (guild_id, cat['name'], cat['emoji'], cat['notified_roles'], cat['button_style'], cat_ch.id)
+            )
+        config = await db.fetchone("SELECT * FROM guild_configs WHERE guild_id=?", (guild_id,))
         panel_ch = self.ctx.guild.get_channel(config['panel_channel_id'])
         panel_embed = discord.Embed(title=config['embed_title'], description=config['embed_description'], color=config['embed_color'])
         if img_url := config['embed_image_url']: panel_embed.set_image(url=img_url)
         if thumb_url := config['embed_thumbnail_url']: panel_embed.set_thumbnail(url=thumb_url)
-        final_view = self.cog.create_panel_view(guild_id)
+        final_view = await self.cog.create_panel_view(guild_id)
         msg = await panel_ch.send(embed=panel_embed, view=final_view)
-        db.execute("UPDATE guild_configs SET panel_message_id = ? WHERE guild_id = ?", (msg.id, guild_id))
+        await db.execute("UPDATE guild_configs SET panel_message_id = ? WHERE guild_id = ?", (msg.id, guild_id))
         await self.message.edit(content=f"{SUCCESS_EMOJI} Setup complete! Panel sent to {panel_ch.mention}.", view=None, embed=None)
         self.stop()
 
+
+# module-level, lazy - same reasoning as DropdownRoles: get_client() needs a
+# running event loop, so it can't be constructed at plain import time.
+db = None
+
+
 class TicketCog(commands.Cog, name="Ticket System"):
     def __init__(self, bot):
-        self.bot, self.db = bot, TicketDatabase(DB_PATH)
-        self.bot.loop.create_task(self.load_persistent_views())
+        self.bot = bot
+
+    async def cog_load(self):
+        global db
+        try:
+            if db is None:
+                db = TicketDatabase()
+            await db.init()
+        except Exception:
+            print("=" * 60)
+            print("[Ticket] FAILED inside db.init() (Turso table setup):")
+            traceback.print_exc()
+            print("=" * 60)
+            raise
+        self.db = db
+
+        try:
+            await self.load_persistent_views()
+        except Exception:
+            print("=" * 60)
+            print("[Ticket] FAILED inside cog_load() while re-registering persistent views:")
+            traceback.print_exc()
+            print("=" * 60)
+            raise
 
     async def load_persistent_views(self):
-        await self.bot.wait_until_ready()
-
-        # 1) Re-register the main ticket panel (the "Open a Ticket" message).
-        for config in self.db.fetchall("SELECT guild_id, panel_message_id FROM guild_configs WHERE panel_message_id IS NOT NULL"):
-            if view := self.create_panel_view(config['guild_id']):
+        # 1) Re-register the main ticket panel.
+        for config in await self.db.fetchall("SELECT guild_id, panel_message_id FROM guild_configs WHERE panel_message_id IS NOT NULL"):
+            if view := await self.create_panel_view(config['guild_id']):
                 self.bot.add_view(view, message_id=config['panel_message_id'])
 
-        # 2) Re-register the action buttons inside every ticket (open or closed).
-        #    This is what makes Lock/Unlock/Claim/Close and Reopen/Transcript/Delete
-        #    keep working after a bot restart, instead of timing out.
-        for t in self.db.fetchall(
+        # 2) Re-register the action buttons inside every ticket (open or closed)
+        #    so Lock/Unlock/Claim/Close and Reopen/Transcript/Delete keep
+        #    working after a restart instead of timing out.
+        for t in await self.db.fetchall(
             "SELECT channel_id, category_db_id, closed_at, action_message_id "
             "FROM open_tickets WHERE action_message_id IS NOT NULL"
         ):
@@ -340,21 +456,22 @@ class TicketCog(commands.Cog, name="Ticket System"):
                 view = TicketActionsView(self, t['channel_id'], t['category_db_id'])
             self.bot.add_view(view, message_id=t['action_message_id'])
 
-    def create_panel_view(self, guild_id):
-        config = self.db.fetchone("SELECT panel_type FROM guild_configs WHERE guild_id=?", (guild_id,))
-        categories = self.db.fetchall("SELECT * FROM ticket_categories WHERE guild_id=?", (guild_id,))
+    async def create_panel_view(self, guild_id):
+        config = await self.db.fetchone("SELECT panel_type FROM guild_configs WHERE guild_id=?", (guild_id,))
+        categories = await self.db.fetchall("SELECT * FROM ticket_categories WHERE guild_id=?", (guild_id,))
         if not config or not categories: return None
         view_class = TicketPanelSelect if config['panel_type'] == 'dropdown' else TicketPanelButtons
         view = view_class(self)
         if config['panel_type'] == 'dropdown':
             view.children[0].options = [discord.SelectOption(label=c['name'], value=str(c['category_id']), emoji=c['emoji']) for c in categories]
         else:
-            for c in categories: view.add_item(discord.ui.Button(label=c['name'], style=discord.ButtonStyle(c['button_style']), emoji=c['emoji'], custom_id=f"create_ticket_{c['category_id']}"))
+            for c in categories:
+                view.add_item(discord.ui.Button(label=c['name'], style=discord.ButtonStyle(c['button_style']), emoji=c['emoji'], custom_id=f"create_ticket_{c['category_id']}"))
         return view
 
     async def refresh_panel(self, guild):
         """Re-renders the live panel message (embed + buttons/select) after a category or color change."""
-        config = self.db.fetchone("SELECT * FROM guild_configs WHERE guild_id=?", (guild.id,))
+        config = await self.db.fetchone("SELECT * FROM guild_configs WHERE guild_id=?", (guild.id,))
         if not config or not config['panel_channel_id'] or not config['panel_message_id']:
             return None
         channel = guild.get_channel(config['panel_channel_id'])
@@ -366,28 +483,35 @@ class TicketCog(commands.Cog, name="Ticket System"):
         embed = discord.Embed(title=config['embed_title'], description=config['embed_description'], color=config['embed_color'])
         if config['embed_image_url']: embed.set_image(url=config['embed_image_url'])
         if config['embed_thumbnail_url']: embed.set_thumbnail(url=config['embed_thumbnail_url'])
-        view = self.create_panel_view(guild.id)
+        view = await self.create_panel_view(guild.id)
         await msg.edit(embed=embed, view=view)
         return msg
 
-    def cog_unload(self): self.db.close()
+    # NOTE: cog_unload that used to call self.db.close() was removed - the
+    # Turso client is shared across every cog (ReactionRoles, DropdownRoles,
+    # Ticket...). Closing it here on unload/reload would break all of them.
 
     @commands.Cog.listener()
     async def on_interaction(self, inter):
-        if inter.type == discord.InteractionType.component and (cid := inter.data.get("custom_id","")).startswith("create_ticket_"): await self.create_ticket_flow(inter, int(cid.split("_")[-1]))
+        if inter.type == discord.InteractionType.component and (cid := inter.data.get("custom_id", "")).startswith("create_ticket_"):
+            await self.create_ticket_flow(inter, int(cid.split("_")[-1]))
 
     async def create_ticket_flow(self, inter, cat_id):
         await inter.response.defer(ephemeral=True)
         guild, user = inter.guild, inter.user
-        if (count := self.db.fetchone("SELECT ticket_count FROM user_ticket_counts WHERE guild_id=? AND user_id=?",(guild.id,user.id))) and count['ticket_count'] >= TICKET_LIMIT_PER_USER: return await inter.followup.send(f"You have reached the max of {TICKET_LIMIT_PER_USER} open tickets.",ephemeral=True)
+        count = await self.db.fetchone("SELECT ticket_count FROM user_ticket_counts WHERE guild_id=? AND user_id=?", (guild.id, user.id))
+        if count and count['ticket_count'] >= TICKET_LIMIT_PER_USER:
+            return await inter.followup.send(f"You have reached the max of {TICKET_LIMIT_PER_USER} open tickets.", ephemeral=True)
 
-        cat_info = self.db.fetchone("SELECT * FROM ticket_categories WHERE category_id=?", (cat_id,))
-        disc_cat = guild.get_channel(cat_info['discord_category_id'])
-        if not cat_info or not disc_cat: return await inter.followup.send("This ticket category has been deleted or is misconfigured.", ephemeral=True)
+        cat_info = await self.db.fetchone("SELECT * FROM ticket_categories WHERE category_id=?", (cat_id,))
+        disc_cat = guild.get_channel(cat_info['discord_category_id']) if cat_info else None
+        if not cat_info or not disc_cat:
+            return await inter.followup.send("This ticket category has been deleted or is misconfigured.", ephemeral=True)
 
-        t_num = (self.db.fetchone("SELECT MAX(ticket_number) as n FROM open_tickets WHERE guild_id=?", (guild.id,))['n'] or 0) + 1
+        max_row = await self.db.fetchone("SELECT MAX(ticket_number) as n FROM open_tickets WHERE guild_id=?", (guild.id,))
+        t_num = (max_row['n'] or 0) + 1
 
-        overwrites = {guild.default_role:discord.PermissionOverwrite(view_channel=False), user:discord.PermissionOverwrite(view_channel=True), guild.me:discord.PermissionOverwrite(view_channel=True, manage_channels=True)}
+        overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False), user: discord.PermissionOverwrite(view_channel=True), guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True)}
 
         pings = [user.mention]
         if cat_info['notified_roles']:
@@ -396,17 +520,25 @@ class TicketCog(commands.Cog, name="Ticket System"):
                     overwrites[role] = discord.PermissionOverwrite(view_channel=True)
                     pings.append(role.mention)
 
-        try: ch = await disc_cat.create_text_channel(name=f"ticket-{t_num:04d}-{user.name.lower()}", overwrites=overwrites)
-        except: return await inter.followup.send("I lack permissions to create a channel.", ephemeral=True)
+        try:
+            ch = await disc_cat.create_text_channel(name=f"ticket-{t_num:04d}-{user.name.lower()}", overwrites=overwrites)
+        except Exception:
+            return await inter.followup.send("I lack permissions to create a channel.", ephemeral=True)
 
-        self.db.execute('INSERT INTO open_tickets (channel_id, ticket_number, guild_id, creator_id, category_db_id, created_at, closed_by_id, closed_at, is_locked, is_claimed, claimed_by_id, action_message_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', (ch.id,t_num,guild.id,user.id,cat_id,datetime.now().isoformat(),None,None,False,False,None,None))
-        self.db.execute('INSERT INTO user_ticket_counts VALUES (?,?,1) ON CONFLICT(guild_id,user_id) DO UPDATE SET ticket_count=ticket_count+1', (guild.id,user.id))
+        await self.db.execute(
+            'INSERT INTO open_tickets (channel_id, ticket_number, guild_id, creator_id, category_db_id, created_at, closed_by_id, closed_at, is_locked, is_claimed, claimed_by_id, action_message_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+            (ch.id, t_num, guild.id, user.id, cat_id, datetime.now().isoformat(), None, None, False, False, None, None)
+        )
+        await self.db.execute(
+            'INSERT INTO user_ticket_counts VALUES (?,?,1) ON CONFLICT(guild_id,user_id) DO UPDATE SET ticket_count=ticket_count+1',
+            (guild.id, user.id)
+        )
         await log_ticket_action(self.db, guild, user, "Ticket Created", f"Ticket {ch.mention} by {user.mention} (Category: {cat_info['name']}).")
 
         ticket_embed = discord.Embed(title=f"Welcome to your Ticket ( #{t_num:04d} )", description="Thank you for reaching out for support. Our staff team has been notified and will be with you as soon as possible.\n\nPlease describe your issue in detail while you wait.", color=EMBED_COLOR)
         ticket_embed.set_image(url=TICKET_CHANNEL_IMAGE_URL)
         action_msg = await ch.send(content=" ".join(pings), embed=ticket_embed, view=TicketActionsView(self, ch.id, cat_id))
-        self.db.execute("UPDATE open_tickets SET action_message_id=? WHERE channel_id=?", (action_msg.id, ch.id))
+        await self.db.execute("UPDATE open_tickets SET action_message_id=? WHERE channel_id=?", (action_msg.id, ch.id))
         await inter.followup.send(f"Your ticket has been successfully created: {ch.mention}", ephemeral=True)
 
     @commands.hybrid_group(name="ticket", description="Main command group for the ticket system.")
@@ -421,7 +553,6 @@ class TicketCog(commands.Cog, name="Ticket System"):
     async def setup(self, ctx, style: app_commands.Choice[str], channel: discord.TextChannel):
         await EmbedEditorView(self, ctx, channel, style.value).start(ctx.interaction)
 
-    # --- NEW: dynamically add a category/button to an already-existing panel ---
     @ticket.group(name="category", description="Add or remove buttons/options from your existing ticket panel.")
     @commands.has_permissions(manage_guild=True)
     async def category(self, ctx):
@@ -445,21 +576,19 @@ class TicketCog(commands.Cog, name="Ticket System"):
     async def category_add(self, ctx, name: str, emoji: str = None, roles: str = None, style: app_commands.Choice[int] = None, category: discord.CategoryChannel = None):
         await ctx.defer(ephemeral=True)
         guild = ctx.guild
-        config = self.db.fetchone("SELECT * FROM guild_configs WHERE guild_id=?", (guild.id,))
+        config = await self.db.fetchone("SELECT * FROM guild_configs WHERE guild_id=?", (guild.id,))
         if not config or not config['panel_message_id']:
             return await ctx.send(f"{ERROR_EMOJI} Run `/ticket setup` first to create your panel, then you can add more categories any time.", ephemeral=True)
 
-        current_count = self.db.fetchone("SELECT COUNT(*) as n FROM ticket_categories WHERE guild_id=?", (guild.id,))['n']
+        current_count = (await self.db.fetchone("SELECT COUNT(*) as n FROM ticket_categories WHERE guild_id=?", (guild.id,)))['n']
         if current_count >= MAX_CATEGORIES:
             return await ctx.send(f"{ERROR_EMOJI} Max of {MAX_CATEGORIES} categories reached.", ephemeral=True)
 
-        if self.db.fetchone("SELECT 1 FROM ticket_categories WHERE guild_id=? AND name=?", (guild.id, name)):
+        if await self.db.fetchone("SELECT 1 FROM ticket_categories WHERE guild_id=? AND name=?", (guild.id, name)):
             return await ctx.send(f"{ERROR_EMOJI} A category named `{name}` already exists.", ephemeral=True)
 
         role_ids = re.findall(r'<@&(\d+)>', roles) if roles else []
 
-        # --- NEW: if the user picked an existing Discord category, reuse it instead of creating one.
-        # This is how you make e.g. 3 different ticket types all land in the same Discord category.
         if category is not None:
             cat_ch = category
         else:
@@ -469,7 +598,7 @@ class TicketCog(commands.Cog, name="Ticket System"):
                 return await ctx.send(f"{ERROR_EMOJI} I don't have permission to create categories.", ephemeral=True)
 
         button_style = style.value if style else discord.ButtonStyle.secondary.value
-        self.db.execute(
+        await self.db.execute(
             "INSERT INTO ticket_categories (guild_id, name, emoji, notified_roles, button_style, discord_category_id) VALUES (?,?,?,?,?,?)",
             (guild.id, name, emoji, ",".join(role_ids) if role_ids else None, button_style, cat_ch.id)
         )
@@ -484,31 +613,28 @@ class TicketCog(commands.Cog, name="Ticket System"):
     async def category_remove(self, ctx, name: str):
         await ctx.defer(ephemeral=True)
         guild = ctx.guild
-        cat = self.db.fetchone("SELECT * FROM ticket_categories WHERE guild_id=? AND name=?", (guild.id, name))
+        cat = await self.db.fetchone("SELECT * FROM ticket_categories WHERE guild_id=? AND name=?", (guild.id, name))
         if not cat:
             return await ctx.send(f"{ERROR_EMOJI} No category named `{name}` found.", ephemeral=True)
 
-        self.db.execute("DELETE FROM ticket_categories WHERE category_id=?", (cat['category_id'],))
+        await self.db.execute("DELETE FROM ticket_categories WHERE category_id=?", (cat['category_id'],))
 
-        # Only auto-delete the Discord category if no other ticket type is still using it
-        # (important now that categories can be shared between multiple ticket types).
-        still_used = self.db.fetchone(
+        still_used = await self.db.fetchone(
             "SELECT 1 FROM ticket_categories WHERE guild_id=? AND discord_category_id=?",
             (guild.id, cat['discord_category_id'])
         )
         if not still_used and (disc_cat := guild.get_channel(cat['discord_category_id'])):
             try: await disc_cat.delete()
-            except: pass
+            except Exception: pass
 
         await self.refresh_panel(guild)
         await ctx.send(f"{SUCCESS_EMOJI} Category `{name}` removed — the panel has been updated.", ephemeral=True)
 
     @category_remove.autocomplete('name')
     async def category_remove_autocomplete(self, interaction: discord.Interaction, current: str):
-        cats = self.db.fetchall("SELECT name FROM ticket_categories WHERE guild_id=?", (interaction.guild.id,))
+        cats = await self.db.fetchall("SELECT name FROM ticket_categories WHERE guild_id=?", (interaction.guild.id,))
         return [app_commands.Choice(name=c['name'], value=c['name']) for c in cats if current.lower() in c['name'].lower()][:25]
 
-    # --- NEW: change the panel embed color any time ---
     @ticket.command(name="color", description="Change the ticket panel embed color.")
     @commands.has_permissions(manage_guild=True)
     @app_commands.describe(hex_color="Hex color code, e.g. #FF0000")
@@ -519,7 +645,7 @@ class TicketCog(commands.Cog, name="Ticket System"):
             return await ctx.send(f"{ERROR_EMOJI} Invalid hex color. Use a format like `FF0000` or `#FF0000`.", ephemeral=True)
 
         color_int = int(hex_clean, 16)
-        self.db.execute(
+        await self.db.execute(
             "INSERT INTO guild_configs (guild_id, embed_color) VALUES (?,?) ON CONFLICT(guild_id) DO UPDATE SET embed_color=excluded.embed_color",
             (ctx.guild.id, color_int)
         )
@@ -527,6 +653,92 @@ class TicketCog(commands.Cog, name="Ticket System"):
         if await self.refresh_panel(ctx.guild) is None:
             return await ctx.send(f"{SUCCESS_EMOJI} Color saved, but I couldn't find a live panel message to update — it'll apply next time you run `/ticket setup`.", ephemeral=True)
         await ctx.send(f"{SUCCESS_EMOJI} Panel embed color updated to `#{hex_clean.upper()}`.", ephemeral=True)
+
+    # --- Text/slash command versions of the action buttons ---
+    async def _dispatch_action(self, ctx: Context, action: str):
+        ephemeral = True if ctx.interaction else False
+        t = await self.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (ctx.channel.id,))
+        if not t:
+            return await ctx.send(f"{ERROR_EMOJI} This isn't a ticket channel.", ephemeral=ephemeral)
+        if t['closed_at']:
+            return await ctx.send(f"{ERROR_EMOJI} This ticket is already closed.", ephemeral=ephemeral)
+
+        # Same permission check as TicketActionsView.interaction_check.
+        cat_info = await self.db.fetchone("SELECT notified_roles FROM ticket_categories WHERE category_id=?", (t['category_db_id'],))
+        if not cat_info or not cat_info['notified_roles']:
+            return await ctx.send(f"{ERROR_EMOJI} This ticket is misconfigured; no staff roles are assigned.", ephemeral=ephemeral)
+        allowed_role_ids = {int(r) for r in cat_info['notified_roles'].split(',')}
+        user_role_ids = {r.id for r in ctx.author.roles}
+        if not user_role_ids.intersection(allowed_role_ids):
+            return await ctx.send(f"{ERROR_EMOJI} You do not have the required role to perform this action.", ephemeral=ephemeral)
+
+        guild, channel, user = ctx.guild, ctx.channel, ctx.author
+
+        if action == "lock":
+            if t['is_locked']:
+                return await ctx.send("This ticket is already locked.", ephemeral=ephemeral)
+            creator = guild.get_member(t['creator_id'])
+            if creator: await channel.set_permissions(creator, send_messages=False)
+            await self.db.execute("UPDATE open_tickets SET is_locked=1 WHERE channel_id=?", (channel.id,))
+            await ctx.send(f"{LOCK_EMOJI} Ticket locked by {user.mention}.")
+            await log_ticket_action(self.db, guild, user, "Locked", f"{channel.mention}")
+
+        elif action == "unlock":
+            if not t['is_locked']:
+                return await ctx.send("This ticket is already unlocked.", ephemeral=ephemeral)
+            creator = guild.get_member(t['creator_id'])
+            if creator: await channel.set_permissions(creator, send_messages=True)
+            await self.db.execute("UPDATE open_tickets SET is_locked=0 WHERE channel_id=?", (channel.id,))
+            await ctx.send(f"{UNLOCK_EMOJI} Ticket unlocked by {user.mention}.")
+            await log_ticket_action(self.db, guild, user, "Unlocked", f"{channel.mention}")
+
+        elif action == "claim":
+            if t['is_claimed']:
+                return await ctx.send(f"This ticket is already claimed by <@{t['claimed_by_id']}>.", ephemeral=ephemeral)
+            await self.db.execute("UPDATE open_tickets SET is_claimed=1, claimed_by_id=? WHERE channel_id=?", (user.id, channel.id))
+            await ctx.send(f"{CLAIM_EMOJI} Ticket claimed by {user.mention}. They will now handle this request.")
+            await log_ticket_action(self.db, guild, user, "Claimed", f"{channel.mention}")
+
+        elif action == "close":
+            if creator := guild.get_member(t['creator_id']):
+                await self.db.execute("UPDATE user_ticket_counts SET ticket_count=MAX(0,ticket_count-1) WHERE guild_id=? AND user_id=?", (guild.id, creator.id))
+                await channel.set_permissions(creator, send_messages=False, view_channel=False)
+
+            category_info = await self.db.fetchone("SELECT name FROM ticket_categories WHERE category_id=?", (t['category_db_id'],))
+            category_name = category_info['name'] if category_info else "Unknown"
+
+            closed_category = await get_or_create_closed_category(self.db, guild)
+            if closed_category: await channel.edit(category=closed_category)
+
+            await self.db.execute("UPDATE open_tickets SET closed_by_id=?, closed_at=? WHERE channel_id=?", (user.id, datetime.now().isoformat(), channel.id))
+            await log_ticket_action(self.db, guild, user, "Closed", f"Ticket {channel.mention} (Category: {category_name})")
+
+            closed_embed = discord.Embed(
+                title="Ticket Closed",
+                description=f"This ticket has been officially closed and archived by {user.mention}.\nThe user has been removed from the channel.\n\nStaff can use the buttons below to reopen, create a transcript, or permanently delete the channel.",
+                color=EMBED_COLOR,
+                timestamp=datetime.now()
+            )
+            closed_embed.add_field(name="Ticket Creator", value=f"<@{t['creator_id']}>", inline=True)
+            closed_embed.add_field(name="Closed By", value=user.mention, inline=True)
+            closed_embed.add_field(name="Original Category", value=category_name, inline=True)
+
+            closed_msg = await channel.send(embed=closed_embed, view=ClosedTicketActionsView(self, channel.id, t['category_db_id']))
+            await self.db.execute("UPDATE open_tickets SET action_message_id=? WHERE channel_id=?", (closed_msg.id, channel.id))
+
+            # Try to disable the buttons on the original action message too
+            # (the button version does this via i.message.edit(view=None)).
+            if t.get('action_message_id'):
+                try:
+                    old_msg = await channel.fetch_message(t['action_message_id'])
+                    await old_msg.edit(view=None)
+                except Exception:
+                    pass
+
+            if ctx.interaction:
+                pass  # main response already sent above via ctx.send
+            else:
+                await ctx.send("Ticket successfully closed and archived.")
 
     @ticket.command(name="close", description="Close the current ticket channel.")
     @commands.has_permissions(manage_channels=True)
@@ -547,16 +759,24 @@ class TicketCog(commands.Cog, name="Ticket System"):
     @ticket.command(name="transcript", description="Generate a transcript of a closed ticket.")
     @commands.has_permissions(manage_channels=True)
     async def transcript(self, ctx):
-        if not ctx.interaction: return await ctx.send("Please use the slash command version of this command.")
-        await ClosedTicketActionsView(self, ctx.channel.id)._generate_transcript(ctx.interaction, False)
+        if not ctx.interaction:
+            return await ctx.send("Please use the slash command version of this command.")
+        t = await self.db.fetchone("SELECT category_db_id FROM open_tickets WHERE channel_id=?", (ctx.channel.id,))
+        if not t:
+            return await ctx.send(f"{ERROR_EMOJI} This isn't a ticket channel.", ephemeral=True)
+        await ClosedTicketActionsView(self, ctx.channel.id, t['category_db_id'])._generate_transcript(ctx.interaction, False)
+
 
 class TicketPanelSelect(discord.ui.View):
     def __init__(self, cog): super().__init__(timeout=None); self.cog = cog
+
     @discord.ui.select(placeholder="Select a category to open a ticket...", custom_id="ticket_panel_select")
     async def select_ticket(self, inter, select): await self.cog.create_ticket_flow(inter, int(select.values[0]))
 
+
 class TicketPanelButtons(discord.ui.View):
     def __init__(self, cog): super().__init__(timeout=None); self.cog = cog
+
 
 class TicketActionsView(discord.ui.View):
     def __init__(self, cog, ch_id, cat_id):
@@ -564,7 +784,7 @@ class TicketActionsView(discord.ui.View):
         self.cog, self.ch_id, self.cat_id = cog, ch_id, cat_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        cat_info = self.cog.db.fetchone("SELECT notified_roles FROM ticket_categories WHERE category_id=?", (self.cat_id,))
+        cat_info = await self.cog.db.fetchone("SELECT notified_roles FROM ticket_categories WHERE category_id=?", (self.cat_id,))
         if not cat_info or not cat_info['notified_roles']:
             await interaction.response.send_message("This ticket is misconfigured; no staff roles are assigned.", ephemeral=True)
             return False
@@ -579,48 +799,48 @@ class TicketActionsView(discord.ui.View):
 
     @discord.ui.button(label="Lock", emoji=LOCK_EMOJI, custom_id="t_lock", style=discord.ButtonStyle.secondary)
     async def b_lock(self, i, b):
-        t = self.cog.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (self.ch_id,))
+        t = await self.cog.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (self.ch_id,))
         if t['is_locked']: return await i.response.send_message("This ticket is already locked.", ephemeral=True)
         creator = i.guild.get_member(t['creator_id'])
         if creator: await i.channel.set_permissions(creator, send_messages=False)
-        self.cog.db.execute("UPDATE open_tickets SET is_locked=1 WHERE channel_id=?", (self.ch_id,))
+        await self.cog.db.execute("UPDATE open_tickets SET is_locked=1 WHERE channel_id=?", (self.ch_id,))
         await i.response.send_message(f"{LOCK_EMOJI} Ticket locked by {i.user.mention}.")
         await log_ticket_action(self.cog.db, i.guild, i.user, "Locked", f"{i.channel.mention}")
 
     @discord.ui.button(label="Unlock", emoji=UNLOCK_EMOJI, custom_id="t_unlock", style=discord.ButtonStyle.secondary)
     async def b_unlock(self, i, b):
-        t = self.cog.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (self.ch_id,))
+        t = await self.cog.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (self.ch_id,))
         if not t['is_locked']: return await i.response.send_message("This ticket is already unlocked.", ephemeral=True)
         creator = i.guild.get_member(t['creator_id'])
         if creator: await i.channel.set_permissions(creator, send_messages=True)
-        self.cog.db.execute("UPDATE open_tickets SET is_locked=0 WHERE channel_id=?", (self.ch_id,))
+        await self.cog.db.execute("UPDATE open_tickets SET is_locked=0 WHERE channel_id=?", (self.ch_id,))
         await i.response.send_message(f"{UNLOCK_EMOJI} Ticket unlocked by {i.user.mention}.")
         await log_ticket_action(self.cog.db, i.guild, i.user, "Unlocked", f"{i.channel.mention}")
 
     @discord.ui.button(label="Claim", emoji=CLAIM_EMOJI, custom_id="t_claim", style=discord.ButtonStyle.primary)
     async def b_claim(self, i, b):
-        t = self.cog.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (self.ch_id,))
+        t = await self.cog.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (self.ch_id,))
         if t['is_claimed']: return await i.response.send_message(f"This ticket is already claimed by <@{t['claimed_by_id']}>.", ephemeral=True)
-        self.cog.db.execute("UPDATE open_tickets SET is_claimed=1, claimed_by_id=? WHERE channel_id=?", (i.user.id, self.ch_id))
+        await self.cog.db.execute("UPDATE open_tickets SET is_claimed=1, claimed_by_id=? WHERE channel_id=?", (i.user.id, self.ch_id))
         await i.response.send_message(f"{CLAIM_EMOJI} Ticket claimed by {i.user.mention}. They will now handle this request.")
         await log_ticket_action(self.cog.db, i.guild, i.user, "Claimed", f"{i.channel.mention}")
 
     @discord.ui.button(label="Close", emoji=CLOSE_EMOJI, style=discord.ButtonStyle.danger, custom_id="t_close")
     async def b_close(self, i, b):
         await i.response.defer(ephemeral=True)
-        t = self.cog.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (self.ch_id,))
+        t = await self.cog.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (self.ch_id,))
         creator = i.guild.get_member(t['creator_id'])
         if creator:
-            self.cog.db.execute("UPDATE user_ticket_counts SET ticket_count=MAX(0,ticket_count-1) WHERE guild_id=? AND user_id=?", (i.guild.id, creator.id))
+            await self.cog.db.execute("UPDATE user_ticket_counts SET ticket_count=MAX(0,ticket_count-1) WHERE guild_id=? AND user_id=?", (i.guild.id, creator.id))
             await i.channel.set_permissions(creator, send_messages=False, view_channel=False)
 
-        category_info = self.cog.db.fetchone("SELECT name FROM ticket_categories WHERE category_id=?", (self.cat_id,))
+        category_info = await self.cog.db.fetchone("SELECT name FROM ticket_categories WHERE category_id=?", (self.cat_id,))
         category_name = category_info['name'] if category_info else "Unknown"
 
         closed_category = await get_or_create_closed_category(self.cog.db, i.guild)
         if closed_category: await i.channel.edit(category=closed_category)
 
-        self.cog.db.execute("UPDATE open_tickets SET closed_by_id=?, closed_at=? WHERE channel_id=?", (i.user.id, datetime.now().isoformat(), self.ch_id))
+        await self.cog.db.execute("UPDATE open_tickets SET closed_by_id=?, closed_at=? WHERE channel_id=?", (i.user.id, datetime.now().isoformat(), self.ch_id))
         await log_ticket_action(self.cog.db, i.guild, i.user, "Closed", f"Ticket {i.channel.mention} (Category: {category_name})")
 
         closed_embed = discord.Embed(
@@ -634,10 +854,11 @@ class TicketActionsView(discord.ui.View):
         closed_embed.add_field(name="Original Category", value=category_name, inline=True)
 
         closed_msg = await i.channel.send(embed=closed_embed, view=ClosedTicketActionsView(self.cog, self.ch_id, self.cat_id))
-        self.cog.db.execute("UPDATE open_tickets SET action_message_id=? WHERE channel_id=?", (closed_msg.id, self.ch_id))
+        await self.cog.db.execute("UPDATE open_tickets SET action_message_id=? WHERE channel_id=?", (closed_msg.id, self.ch_id))
         await i.message.edit(view=None)
         await i.followup.send("Ticket successfully closed and archived.", ephemeral=True)
         self.stop()
+
 
 class ClosedTicketActionsView(discord.ui.View):
     def __init__(self, cog, ch_id, cat_id):
@@ -645,7 +866,7 @@ class ClosedTicketActionsView(discord.ui.View):
         self.cog, self.ch_id, self.cat_id = cog, ch_id, cat_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        cat_info = self.cog.db.fetchone("SELECT notified_roles FROM ticket_categories WHERE category_id=?", (self.cat_id,))
+        cat_info = await self.cog.db.fetchone("SELECT notified_roles FROM ticket_categories WHERE category_id=?", (self.cat_id,))
         if not cat_info or not cat_info['notified_roles']: return False
         allowed_role_ids = {int(r_id) for r_id in cat_info['notified_roles'].split(',')}
         user_role_ids = {role.id for role in interaction.user.roles}
@@ -657,22 +878,22 @@ class ClosedTicketActionsView(discord.ui.View):
     @discord.ui.button(label="Reopen", emoji=REOPEN_EMOJI, style=discord.ButtonStyle.success, custom_id="t_reopen")
     async def b_reopen(self, i: discord.Interaction, button: discord.ui.Button):
         await i.response.defer(ephemeral=True)
-        t = self.cog.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (self.ch_id,))
-        cat_info = self.cog.db.fetchone("SELECT discord_category_id FROM ticket_categories WHERE category_id=?", (self.cat_id,))
+        t = await self.cog.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (self.ch_id,))
+        cat_info = await self.cog.db.fetchone("SELECT discord_category_id FROM ticket_categories WHERE category_id=?", (self.cat_id,))
 
-        original_category = i.guild.get_channel(cat_info['discord_category_id'])
+        original_category = i.guild.get_channel(cat_info['discord_category_id']) if cat_info else None
         if original_category: await i.channel.edit(category=original_category)
 
         creator = i.guild.get_member(t['creator_id'])
         if creator:
             await i.channel.set_permissions(creator, view_channel=True, send_messages=True)
-            self.cog.db.execute("INSERT INTO user_ticket_counts VALUES (?,?,1) ON CONFLICT(guild_id,user_id) DO UPDATE SET ticket_count=ticket_count+1", (i.guild.id, creator.id))
+            await self.cog.db.execute("INSERT INTO user_ticket_counts VALUES (?,?,1) ON CONFLICT(guild_id,user_id) DO UPDATE SET ticket_count=ticket_count+1", (i.guild.id, creator.id))
 
-        self.cog.db.execute("UPDATE open_tickets SET closed_by_id=NULL, closed_at=NULL WHERE channel_id=?", (self.ch_id,))
+        await self.cog.db.execute("UPDATE open_tickets SET closed_by_id=NULL, closed_at=NULL WHERE channel_id=?", (self.ch_id,))
 
         reopen_embed = discord.Embed(title="Ticket Reopened", description=f"This ticket has been reopened by {i.user.mention}.", color=EMBED_COLOR)
         reopen_msg = await i.channel.send(embed=reopen_embed, view=TicketActionsView(self.cog, self.ch_id, self.cat_id))
-        self.cog.db.execute("UPDATE open_tickets SET action_message_id=? WHERE channel_id=?", (reopen_msg.id, self.ch_id))
+        await self.cog.db.execute("UPDATE open_tickets SET action_message_id=? WHERE channel_id=?", (reopen_msg.id, self.ch_id))
         await i.message.edit(view=None)
         await log_ticket_action(self.cog.db, i.guild, i.user, "Reopened", f"{i.channel.mention}")
         self.stop()
@@ -697,16 +918,25 @@ class ClosedTicketActionsView(discord.ui.View):
 
         try:
             await i.user.send(f"Transcript for ticket {ch.mention} in {i.guild.name}:", file=file)
-            await i.followup.send(f"Transcript sent to your DMs.", ephemeral=True)
-        except: await i.followup.send("Could not DM you the transcript. Do you have DMs disabled?", file=file, ephemeral=True)
+            await i.followup.send("Transcript sent to your DMs.", ephemeral=True)
+        except Exception:
+            await i.followup.send("Could not DM you the transcript. Do you have DMs disabled?", file=file, ephemeral=True)
 
         if delete_after:
             await i.followup.send("This ticket channel will be permanently deleted in 10 seconds...", ephemeral=True)
             await log_ticket_action(self.cog.db, i.guild, i.user, "Deletion Scheduled", f"{ch.mention}")
             await asyncio.sleep(10)
             await ch.delete()
-            self.cog.db.execute("DELETE FROM open_tickets WHERE channel_id=?", (self.ch_id,))
+            await self.cog.db.execute("DELETE FROM open_tickets WHERE channel_id=?", (self.ch_id,))
+
 
 async def setup(bot):
-    await bot.add_cog(TicketCog(bot))
-    
+    try:
+        await bot.add_cog(TicketCog(bot))
+    except Exception:
+        print("=" * 60)
+        print("[Ticket] FAILED inside setup(bot) / bot.add_cog():")
+        traceback.print_exc()
+        print("=" * 60)
+        raise
+        
