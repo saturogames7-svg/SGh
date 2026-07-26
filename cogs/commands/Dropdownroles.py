@@ -101,10 +101,21 @@ class DropdownRolesDB:
         return [tuple(row) for row in result.rows]
 
 
-# Module-level shared instance. Only wires up the client reference here -
-# table creation/migration happens later via `await db.init()` inside
-# cog_load(), because this line runs at import time and import can't be async.
-db = DropdownRolesDB()
+# Module-level reference, created LAZILY - not here at import time.
+#
+# Why: this file gets imported as part of `import cogs` at the very top of
+# the bot's entrypoint, before bot.run()/asyncio.run() ever starts an event
+# loop. get_client() -> libsql_client.create_client() constructs an
+# aiohttp.ClientSession() under the hood, and aiohttp requires a RUNNING
+# event loop to do that ("RuntimeError: no running event loop" is exactly
+# what happens if you call it at plain import time). Since this crashed
+# inside a bare `import cogs` at the top of CodeX.py, it took down the whole
+# process before the bot even started - not just this one cog.
+#
+# Fix: don't touch get_client()/DropdownRolesDB() until we're inside an
+# async function that's actually running on the bot's event loop. That's
+# cog_load() below, which is awaited by discord.py after the loop exists.
+db = None
 
 
 def validate_emoji(emoji: str, bot: commands.Bot = None):
@@ -278,9 +289,14 @@ class DropdownRoles(Cog):
         self.bot = bot
 
     async def cog_load(self):
-        # 1) Make sure the Turso tables exist / are migrated before anything
-        #    below tries to read or write them.
+        # 1) Create the DropdownRolesDB (and the shared Turso client inside
+        #    it) HERE, not at module import time - this is the first place
+        #    in this file that's guaranteed to run inside a live event loop.
+        #    Then make sure the Turso tables exist / are migrated.
+        global db
         try:
+            if db is None:
+                db = DropdownRolesDB()
             await db.init()
         except Exception:
             print("=" * 60)
@@ -552,3 +568,4 @@ async def setup(bot):
         traceback.print_exc()
         print("=" * 60)
         raise
+        
