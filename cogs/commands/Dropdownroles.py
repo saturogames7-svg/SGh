@@ -1,6 +1,7 @@
 import discord
 import emoji as emoji_lib
 import sqlite3
+import traceback
 from discord.ext import commands
 from discord.ext.commands import Context
 from core.Cog import Cog
@@ -105,7 +106,23 @@ class DropdownRolesDB:
             return cur.fetchall()
 
 
-db = DropdownRolesDB()
+# --- DIAGNOSTIC WRAP ---
+# This cog wasn't showing up as "Loaded cog: DropdownRoles" in the logs at
+# all, which means the extension is failing before it even gets registered -
+# most likely right here, since this line runs immediately at import time
+# (before Discord, before the Cog, before anything). If the bot's loader
+# swallows exceptions during `load_extension` without printing them, we'd
+# never see why. This print/traceback runs regardless of what the loader
+# does afterward, so it WILL show up in the console the next time this
+# fails - remove it once the real cause is confirmed and fixed.
+try:
+    db = DropdownRolesDB()
+except Exception:
+    print("=" * 60)
+    print("[DropdownRoles] FAILED to initialize DropdownRolesDB() at import time:")
+    traceback.print_exc()
+    print("=" * 60)
+    raise
 
 
 def validate_emoji(emoji: str, bot: commands.Bot = None):
@@ -264,10 +281,20 @@ class DropdownRoles(Cog):
         self.bot = bot
 
     async def cog_load(self):
-        # Re-register persistent views for existing menus so they survive restarts
-        for message_id, guild_id, channel_id, custom_id, placeholder, max_values in db.get_all_menus():
-            view = RoleDropdownView(message_id, custom_id, placeholder, max_values)
-            self.bot.add_view(view, message_id=message_id)
+        # Re-register persistent views for existing menus so they survive restarts.
+        # Wrapped defensively + logged: if this file's custom_id format ever
+        # changes, or a stored row is malformed, we want the error printed
+        # loudly here rather than silently killing the whole cog load.
+        try:
+            for message_id, guild_id, channel_id, custom_id, placeholder, max_values in db.get_all_menus():
+                view = RoleDropdownView(message_id, custom_id, placeholder, max_values)
+                self.bot.add_view(view, message_id=message_id)
+        except Exception:
+            print("=" * 60)
+            print("[DropdownRoles] FAILED inside cog_load() while re-registering persistent views:")
+            traceback.print_exc()
+            print("=" * 60)
+            raise
 
     @commands.hybrid_command(name="checkoptions", help="Diagnose which stored option(s) have a broken emoji.", usage="checkoptions <message_id>")
     @commands.has_permissions(manage_roles=True)
@@ -478,5 +505,11 @@ class DropdownRoles(Cog):
 
 
 async def setup(bot):
-    await bot.add_cog(DropdownRoles(bot))
-    
+    try:
+        await bot.add_cog(DropdownRoles(bot))
+    except Exception:
+        print("=" * 60)
+        print("[DropdownRoles] FAILED inside setup(bot) / bot.add_cog():")
+        traceback.print_exc()
+        print("=" * 60)
+        raise
