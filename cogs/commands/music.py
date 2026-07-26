@@ -1,17 +1,3 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                                                                  ║
-# ║   ░█▀▀░█▀█░█▀▄░█▀▀░█░█   ░█▀▄░█▀▀░█░█░█▀▀                     ║
-# ║   ░█░░░█░█░█░█░█▀▀░▄▀▄   ░█░█░█▀▀░▀▄▀░▀▀█                     ║
-# ║   ░▀▀▀░▀▀▀░▀▀░░▀▀▀░▀░▀   ░▀▀░░▀▀▀░░▀░░▀▀▀                     ║
-# ║                                                                  ║
-# ║            © 2026 CodeX Devs — All Rights Reserved              ║
-# ║                                                                  ║
-# ║   discord  ──  https://discord.gg/codexdev                      ║
-# ║   youtube  ──  https://youtube.com/@CodeXDevs                   ║
-# ║   github   ──  https://github.com/RayExo                        ║
-# ║                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
 import os
 import random
 import discord
@@ -958,6 +944,40 @@ class Music(commands.Cog):
 
         await ctx.send(view=CV2(f"Seeked to {percentage}% of the current track."))
 
+    @commands.command(name="default", usage="default", help="Makes the bot self-mute and self-deafen (closes mic & speaker).")
+    @blacklist_check()
+    @ignore_check()
+    @commands.cooldown(1, 3, commands.BucketType.user)
+    async def default(self, ctx: commands.Context):
+        vc = ctx.voice_client
+        if not vc:
+            await ctx.send(view=CV2(f"{WARNING} I'm not connected to any voice channel."))
+            return
+
+        if not ctx.author.voice or ctx.author.voice.channel.id != vc.channel.id:
+            await ctx.send(view=CV2(f"{WARNING} You need to be in the same voice channel as me to use this command."))
+            return
+
+        await ctx.guild.change_voice_state(channel=vc.channel, self_mute=True, self_deaf=True)
+        await ctx.send(view=CV2(f"{TICK} Default mode enabled — mic and speaker are now muted."))
+
+    @commands.command(name="undefault", usage="undefault", help="Removes default mode (unmutes mic & speaker).")
+    @blacklist_check()
+    @ignore_check()
+    @commands.cooldown(1, 3, commands.BucketType.user)
+    async def undefault(self, ctx: commands.Context):
+        vc = ctx.voice_client
+        if not vc:
+            await ctx.send(view=CV2(f"{WARNING} I'm not connected to any voice channel."))
+            return
+
+        if not ctx.author.voice or ctx.author.voice.channel.id != vc.channel.id:
+            await ctx.send(view=CV2(f"{WARNING} You need to be in the same voice channel as me to use this command."))
+            return
+
+        await ctx.guild.change_voice_state(channel=vc.channel, self_mute=False, self_deaf=False)
+        await ctx.send(view=CV2(f"{TICK} Default mode disabled — mic and speaker are unmuted."))
+
     @commands.Cog.listener()
     async def on_wavelink_track_start(self, payload: wavelink.TrackStartEventPayload):
         player = payload.player
@@ -986,3 +1006,4 @@ class Music(commands.Cog):
         if voice_channel:
             await voice_channel.edit(status=None)  # type: ignore
         await self.on_track_end(payload)
+        
