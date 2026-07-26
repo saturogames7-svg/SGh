@@ -4,25 +4,23 @@ Feature set: interactive setup panel (Views/Buttons/Selects/Modals),
 configurable embed/plain messages with full variable support,
 fake/rejoin/left invite detection, leaderboard, manual invite management.
 
-Requires: discord.py>=2.0, aiosqlite
+Requires: discord.py>=2.0
+Storage: Turso (shared client via utils.turso_db.get_client()).
 """
 
-import os
 import re
 import datetime
 import traceback
 from typing import Optional, Dict, Any, List, Tuple
 
-import aiosqlite
 import discord
 from discord.ext import commands
+from utils.turso_db import get_client
 
 
 # --------------------------------------------------------------------------
 # CONSTANTS
 # --------------------------------------------------------------------------
-
-INVITE_DB = "db/invite.db"
 
 DEFAULT_MESSAGE = "📥 {member} joined, invited by {user} • Total invites: **{invites}**"
 DEFAULT_EMBED_TITLE = "👋 Welcome to {server}!"
@@ -162,62 +160,76 @@ def apply_variables(
 
 
 # --------------------------------------------------------------------------
-# DATABASE LAYER
+# DATABASE LAYER (Turso)
 # --------------------------------------------------------------------------
 
 class InviteDatabase:
-    """Thin async wrapper around all invite-tracker SQLite tables."""
+    """Thin async wrapper around all invite-tracker tables, backed by Turso."""
 
-    def __init__(self, path: str = INVITE_DB):
-        self.path = path
+    def __init__(self):
+        # get_client() only returns the shared client reference, no network
+        # I/O - safe to call from a plain sync __init__ (same reasoning as
+        # WelcomeDatabase/TicketDatabase/DropdownRolesDB).
+        self.client = get_client()
 
     async def init(self) -> None:
-        directory = os.path.dirname(self.path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
+        await self.client.execute(
+            """
+            CREATE TABLE IF NOT EXISTS invite_config (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER,
+                message TEXT DEFAULT '',
+                embed_enabled INTEGER DEFAULT 1,
+                embed_title TEXT DEFAULT '',
+                embed_description TEXT DEFAULT '',
+                embed_color INTEGER DEFAULT 0,
+                embed_footer TEXT DEFAULT '',
+                embed_thumbnail TEXT DEFAULT '',
+                embed_image TEXT DEFAULT ''
+            )
+            """
+        )
+        await self.client.execute(
+            """
+            CREATE TABLE IF NOT EXISTS invite_stats (
+                guild_id INTEGER,
+                user_id INTEGER,
+                total INTEGER DEFAULT 0,
+                fake INTEGER DEFAULT 0,
+                left INTEGER DEFAULT 0,
+                rejoin INTEGER DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
+        await self.client.execute(
+            """
+            CREATE TABLE IF NOT EXISTS invite_history (
+                guild_id INTEGER,
+                member_id INTEGER,
+                inviter_id INTEGER,
+                joined_at TEXT,
+                PRIMARY KEY (guild_id, member_id)
+            )
+            """
+        )
 
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS invite_config (
-                    guild_id INTEGER PRIMARY KEY,
-                    channel_id INTEGER,
-                    message TEXT DEFAULT '',
-                    embed_enabled INTEGER DEFAULT 1,
-                    embed_title TEXT DEFAULT '',
-                    embed_description TEXT DEFAULT '',
-                    embed_color INTEGER DEFAULT 0,
-                    embed_footer TEXT DEFAULT '',
-                    embed_thumbnail TEXT DEFAULT '',
-                    embed_image TEXT DEFAULT ''
-                )
-                """
-            )
-            await db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS invite_stats (
-                    guild_id INTEGER,
-                    user_id INTEGER,
-                    total INTEGER DEFAULT 0,
-                    fake INTEGER DEFAULT 0,
-                    left INTEGER DEFAULT 0,
-                    rejoin INTEGER DEFAULT 0,
-                    PRIMARY KEY (guild_id, user_id)
-                )
-                """
-            )
-            await db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS invite_history (
-                    guild_id INTEGER,
-                    member_id INTEGER,
-                    inviter_id INTEGER,
-                    joined_at TEXT,
-                    PRIMARY KEY (guild_id, member_id)
-                )
-                """
-            )
-            await db.commit()
+    @staticmethod
+    def _row_to_dict(columns, row):
+        return {col: row[i] for i, col in enumerate(columns)}
+
+    async def execute(self, q, p=()):
+        return await self.client.execute(q, list(p))
+
+    async def fetchone(self, q, p=()):
+        result = await self.client.execute(q, list(p))
+        if not result.rows:
+            return None
+        return self._row_to_dict(result.columns, result.rows[0])
+
+    async def fetchall(self, q, p=()):
+        result = await self.client.execute(q, list(p))
+        return [self._row_to_dict(result.columns, row) for row in result.rows]
 
     # ---------------------------- CONFIG ---------------------------------
 
@@ -236,12 +248,7 @@ class InviteDatabase:
         }
 
     async def get_config(self, guild_id: int) -> Dict[str, Any]:
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM invite_config WHERE guild_id=?", (guild_id,)
-            )
-            row = await cursor.fetchone()
+        row = await self.fetchone("SELECT * FROM invite_config WHERE guild_id=?", (guild_id,))
 
         if not row:
             return self.default_config(guild_id)
@@ -260,38 +267,36 @@ class InviteDatabase:
         }
 
     async def save_config(self, guild_id: int, config: Dict[str, Any]) -> None:
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                """
-                INSERT INTO invite_config (
-                    guild_id, channel_id, message, embed_enabled, embed_title,
-                    embed_description, embed_color, embed_footer, embed_thumbnail, embed_image
-                ) VALUES (?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(guild_id) DO UPDATE SET
-                    channel_id=excluded.channel_id,
-                    message=excluded.message,
-                    embed_enabled=excluded.embed_enabled,
-                    embed_title=excluded.embed_title,
-                    embed_description=excluded.embed_description,
-                    embed_color=excluded.embed_color,
-                    embed_footer=excluded.embed_footer,
-                    embed_thumbnail=excluded.embed_thumbnail,
-                    embed_image=excluded.embed_image
-                """,
-                (
-                    guild_id,
-                    config.get("channel_id"),
-                    config.get("message", DEFAULT_MESSAGE),
-                    int(bool(config.get("embed_enabled", True))),
-                    config.get("embed_title", DEFAULT_EMBED_TITLE),
-                    config.get("embed_description", DEFAULT_EMBED_DESCRIPTION),
-                    int(config.get("embed_color", DEFAULT_EMBED_COLOR)),
-                    config.get("embed_footer", ""),
-                    config.get("embed_thumbnail", ""),
-                    config.get("embed_image", ""),
-                ),
-            )
-            await db.commit()
+        await self.execute(
+            """
+            INSERT INTO invite_config (
+                guild_id, channel_id, message, embed_enabled, embed_title,
+                embed_description, embed_color, embed_footer, embed_thumbnail, embed_image
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                channel_id=excluded.channel_id,
+                message=excluded.message,
+                embed_enabled=excluded.embed_enabled,
+                embed_title=excluded.embed_title,
+                embed_description=excluded.embed_description,
+                embed_color=excluded.embed_color,
+                embed_footer=excluded.embed_footer,
+                embed_thumbnail=excluded.embed_thumbnail,
+                embed_image=excluded.embed_image
+            """,
+            (
+                guild_id,
+                config.get("channel_id"),
+                config.get("message", DEFAULT_MESSAGE),
+                int(bool(config.get("embed_enabled", True))),
+                config.get("embed_title", DEFAULT_EMBED_TITLE),
+                config.get("embed_description", DEFAULT_EMBED_DESCRIPTION),
+                int(config.get("embed_color", DEFAULT_EMBED_COLOR)),
+                config.get("embed_footer", ""),
+                config.get("embed_thumbnail", ""),
+                config.get("embed_image", ""),
+            ),
+        )
 
     async def reset_config(self, guild_id: int) -> Dict[str, Any]:
         defaults = self.default_config(guild_id)
@@ -300,24 +305,22 @@ class InviteDatabase:
 
     # ---------------------------- STATS -----------------------------------
 
-    async def ensure_stats_row(self, db: aiosqlite.Connection, guild_id: int, user_id: int) -> None:
-        await db.execute(
+    async def ensure_stats_row(self, guild_id: int, user_id: int) -> None:
+        await self.execute(
             "INSERT OR IGNORE INTO invite_stats (guild_id, user_id) VALUES (?,?)",
             (guild_id, user_id),
         )
 
     async def get_stats(self, guild_id: int, user_id: int) -> Dict[str, int]:
-        async with aiosqlite.connect(self.path) as db:
-            cursor = await db.execute(
-                "SELECT total, fake, left, rejoin FROM invite_stats WHERE guild_id=? AND user_id=?",
-                (guild_id, user_id),
-            )
-            row = await cursor.fetchone()
+        row = await self.fetchone(
+            "SELECT total, fake, left, rejoin FROM invite_stats WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        )
 
         if not row:
             return {"total": 0, "fake": 0, "left": 0, "rejoin": 0, "real": 0}
 
-        total, fake, left, rejoin = row
+        total, fake, left, rejoin = row["total"], row["fake"], row["left"], row["rejoin"]
         real = max(total - fake - left, 0)
         return {"total": total, "fake": fake, "left": left, "rejoin": rejoin, "real": real}
 
@@ -325,13 +328,11 @@ class InviteDatabase:
         if column not in ("total", "fake", "left", "rejoin"):
             raise ValueError("Invalid stats column")
 
-        async with aiosqlite.connect(self.path) as db:
-            await self.ensure_stats_row(db, guild_id, user_id)
-            await db.execute(
-                f"UPDATE invite_stats SET {column} = {column} + ? WHERE guild_id=? AND user_id=?",
-                (amount, guild_id, user_id),
-            )
-            await db.commit()
+        await self.ensure_stats_row(guild_id, user_id)
+        await self.execute(
+            f"UPDATE invite_stats SET {column} = {column} + ? WHERE guild_id=? AND user_id=?",
+            (amount, guild_id, user_id),
+        )
 
     async def set_stats(
         self,
@@ -348,69 +349,59 @@ class InviteDatabase:
         new_left = current["left"] if left is None else left
         new_rejoin = current["rejoin"] if rejoin is None else rejoin
 
-        async with aiosqlite.connect(self.path) as db:
-            await self.ensure_stats_row(db, guild_id, user_id)
-            await db.execute(
-                """
-                UPDATE invite_stats
-                SET total=?, fake=?, left=?, rejoin=?
-                WHERE guild_id=? AND user_id=?
-                """,
-                (new_total, new_fake, new_left, new_rejoin, guild_id, user_id),
-            )
-            await db.commit()
+        await self.ensure_stats_row(guild_id, user_id)
+        await self.execute(
+            """
+            UPDATE invite_stats
+            SET total=?, fake=?, left=?, rejoin=?
+            WHERE guild_id=? AND user_id=?
+            """,
+            (new_total, new_fake, new_left, new_rejoin, guild_id, user_id),
+        )
 
     async def reset_stats(self, guild_id: int, user_id: int) -> None:
         await self.set_stats(guild_id, user_id, total=0, fake=0, left=0, rejoin=0)
 
     async def leaderboard(self, guild_id: int, limit: int = 10) -> List[Tuple[int, int, int, int, int]]:
-        async with aiosqlite.connect(self.path) as db:
-            cursor = await db.execute(
-                """
-                SELECT user_id, total, fake, left, rejoin
-                FROM invite_stats
-                WHERE guild_id=?
-                ORDER BY (total - fake - left) DESC
-                LIMIT ?
-                """,
-                (guild_id, limit),
-            )
-            rows = await cursor.fetchall()
-        return rows
+        rows = await self.fetchall(
+            """
+            SELECT user_id, total, fake, left, rejoin
+            FROM invite_stats
+            WHERE guild_id=?
+            ORDER BY (total - fake - left) DESC
+            LIMIT ?
+            """,
+            (guild_id, limit),
+        )
+        return [(r["user_id"], r["total"], r["fake"], r["left"], r["rejoin"]) for r in rows]
 
     # ---------------------------- HISTORY ----------------------------------
 
     async def get_history(self, guild_id: int, member_id: int) -> Optional[int]:
-        async with aiosqlite.connect(self.path) as db:
-            cursor = await db.execute(
-                "SELECT inviter_id FROM invite_history WHERE guild_id=? AND member_id=?",
-                (guild_id, member_id),
-            )
-            row = await cursor.fetchone()
-        return row[0] if row else None
+        row = await self.fetchone(
+            "SELECT inviter_id FROM invite_history WHERE guild_id=? AND member_id=?",
+            (guild_id, member_id),
+        )
+        return row["inviter_id"] if row else None
 
     async def has_history(self, guild_id: int, member_id: int) -> bool:
-        async with aiosqlite.connect(self.path) as db:
-            cursor = await db.execute(
-                "SELECT 1 FROM invite_history WHERE guild_id=? AND member_id=?",
-                (guild_id, member_id),
-            )
-            row = await cursor.fetchone()
+        row = await self.fetchone(
+            "SELECT 1 FROM invite_history WHERE guild_id=? AND member_id=?",
+            (guild_id, member_id),
+        )
         return row is not None
 
     async def record_history(self, guild_id: int, member_id: int, inviter_id: Optional[int]) -> None:
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                """
-                INSERT INTO invite_history (guild_id, member_id, inviter_id, joined_at)
-                VALUES (?,?,?,?)
-                ON CONFLICT(guild_id, member_id) DO UPDATE SET
-                    inviter_id=excluded.inviter_id,
-                    joined_at=excluded.joined_at
-                """,
-                (guild_id, member_id, inviter_id, discord.utils.utcnow().isoformat()),
-            )
-            await db.commit()
+        await self.execute(
+            """
+            INSERT INTO invite_history (guild_id, member_id, inviter_id, joined_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(guild_id, member_id) DO UPDATE SET
+                inviter_id=excluded.inviter_id,
+                joined_at=excluded.joined_at
+            """,
+            (guild_id, member_id, inviter_id, discord.utils.utcnow().isoformat()),
+        )
 
 
 # --------------------------------------------------------------------------
@@ -805,14 +796,27 @@ class Tracking(commands.Cog, name="Invite Tracker"):
 
     This cog contains the actual working logic (database, listeners, commands).
     The help-menu display (help_custom + the `InviteTracker` group) lives in a
-    separate cog file (invite_tracker_menu.py) and is loaded independently.
+    separate cog file (cogs/zyrox/inviteTracker.py) and is loaded independently.
     """
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.db = InviteDatabase(INVITE_DB)
         self.invites_cache: Dict[int, List[discord.Invite]] = {}
         self.vanity_cache: Dict[int, int] = {}
+
+    async def cog_load(self):
+        # DB creation/init happens here (not __init__), guaranteed to run
+        # inside a live event loop before any command/listener can fire -
+        # same reasoning as WelcomeDatabase/TicketDatabase/DropdownRolesDB.
+        try:
+            self.db = InviteDatabase()
+            await self.db.init()
+        except Exception:
+            print("=" * 60)
+            print("[Tracking/InviteTracker] FAILED inside cog_load() (Turso table setup):")
+            traceback.print_exc()
+            print("=" * 60)
+            raise
 
     # ------------------------------ CACHING --------------------------------
 
@@ -835,13 +839,14 @@ class Tracking(commands.Cog, name="Invite Tracker"):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        await self.db.init()
+        # NOTE: db.init() used to be called here (and could re-run on every
+        # reconnect). It now happens once in cog_load(); this listener only
+        # refreshes the invite cache.
         for guild in self.bot.guilds:
             await self.cache_invites(guild)
 
     @commands.Cog.listener()
     async def on_guild_join(self, guild: discord.Guild):
-        await self.db.init()
         await self.cache_invites(guild)
 
     @commands.Cog.listener()
@@ -1158,14 +1163,10 @@ class Tracking(commands.Cog, name="Invite Tracker"):
             await ctx.send("❌ I don't have permission to perform that action.")
             return
 
-        if isinstance(error, aiosqlite.Error):
-            await ctx.send("❌ A database error occurred. Please try again later.")
-            traceback.print_exc()
-            return
-
         traceback.print_exc()
         await ctx.send("❌ An unexpected error occurred while running that command.")
 
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Tracking(bot))
+    
