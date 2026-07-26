@@ -83,6 +83,20 @@ async def get_or_create_closed_category(db, guild):
         return cat
     except: return None
 
+def resolve_existing_category(guild, raw_input):
+    """Try to resolve a user-typed string (ID or name) to an existing discord.CategoryChannel."""
+    raw_input = raw_input.strip()
+    found = None
+    if raw_input.isdigit():
+        found = guild.get_channel(int(raw_input))
+    if not found:
+        # allow "#123456789012345" style copy-paste mistakes and plain names
+        cleaned = raw_input.lstrip('#')
+        found = discord.utils.find(lambda c: c.name.lower() == raw_input.lower() or c.name.lower() == cleaned.lower(), guild.categories)
+    if found and isinstance(found, discord.CategoryChannel):
+        return found
+    return None
+
 # --- Setup Views ---
 class EmbedEditorView(discord.ui.View):
     def __init__(self, cog, ctx, panel_channel, panel_type):
@@ -174,7 +188,13 @@ class CategoryConfigView(discord.ui.View):
 
     def _update_embed(self):
         embed = discord.Embed(title="Category Configuration", description="Add or remove ticket categories for your panel.", color=EMBED_COLOR)
-        embed.add_field(name="Current Categories", value="\n".join([f"{c['emoji'] or ''} {c['name']}" for c in self.categories]) or "None yet. Click 'Add Category' to begin.")
+        lines = []
+        for c in self.categories:
+            line = f"{c['emoji'] or ''} {c['name']}"
+            if c.get('existing_category_id'):
+                line += " *(shared/existing Discord category)*"
+            lines.append(line)
+        embed.add_field(name="Current Categories", value="\n".join(lines) or "None yet. Click 'Add Category' to begin.")
         return embed
 
     def _update_remove_select(self):
@@ -220,15 +240,36 @@ class CategoryConfigView(discord.ui.View):
             for role_id_str in role_mentions:
                 role_ids.append(int(role_id_str))
 
+        # --- NEW: let the user point this ticket type at an EXISTING Discord category ---
+        # so multiple ticket types (e.g. 3 categories) can share the same Discord category,
+        # instead of the bot always creating a brand-new one.
+        existing_cat_input = await self._prompt(
+            inter,
+            "If you want this ticket type's channels to go inside an **existing** Discord category, "
+            "type that category's name or ID now. Otherwise type `new` and I'll create a fresh category for it.",
+            followup=True
+        )
+        if not existing_cat_input: return await inter.followup.send("Timed out.", ephemeral=True)
+
+        existing_category_id = None
+        if existing_cat_input.lower() != 'new':
+            found_cat = resolve_existing_category(self.ctx.guild, existing_cat_input)
+            if found_cat:
+                existing_category_id = found_cat.id
+                await inter.followup.send(f"{SUCCESS_EMOJI} Got it, tickets for `{cat_name}` will be created inside **{found_cat.name}**.", ephemeral=True)
+            else:
+                await inter.followup.send(f"{ERROR_EMOJI} Couldn't find a category with that name/ID, I'll create a new one instead.", ephemeral=True)
+
         self.categories.append({
             "name": cat_name,
             "emoji": emoji,
             "notified_roles": ",".join(map(str, role_ids)) if role_ids else None,
-            "button_style": discord.ButtonStyle.secondary.value
+            "button_style": discord.ButtonStyle.secondary.value,
+            "existing_category_id": existing_category_id
         })
         self._update_remove_select()
         await self.message.edit(embed=self._update_embed(), view=self)
-        await inter.followup.send(f"Category '{cat_name}' added/removed successfully.", ephemeral=True)
+        await inter.followup.send(f"Category '{cat_name}' added successfully.", ephemeral=True)
 
     async def _remove_category(self, inter, value):
         if value == "placeholder": return await inter.response.defer()
@@ -248,8 +289,14 @@ class CategoryConfigView(discord.ui.View):
         db, guild_id = self.cog.db, self.ctx.guild.id
         db.execute("DELETE FROM ticket_categories WHERE guild_id = ?", (guild_id,))
         for cat in self.categories:
-            try: cat_ch = await self.ctx.guild.create_category(f"{cat['name']} Tickets", overwrites={self.ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False)})
-            except: return await inter.followup.send(f"Can't create category for `{cat['name']}`.", ephemeral=True)
+            # If the user pointed this ticket type at an existing Discord category, reuse it.
+            # Otherwise create a brand-new one, same as before.
+            existing_id = cat.get("existing_category_id")
+            cat_ch = self.ctx.guild.get_channel(existing_id) if existing_id else None
+            if not cat_ch:
+                try:
+                    cat_ch = await self.ctx.guild.create_category(f"{cat['name']} Tickets", overwrites={self.ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False)})
+                except: return await inter.followup.send(f"Can't create category for `{cat['name']}`.", ephemeral=True)
             db.execute('INSERT INTO ticket_categories (guild_id, name, emoji, notified_roles, button_style, discord_category_id) VALUES (?,?,?,?,?,?)', (guild_id,cat['name'],cat['emoji'],cat['notified_roles'],cat['button_style'],cat_ch.id))
         config = db.fetchone("SELECT * FROM guild_configs WHERE guild_id=?", (guild_id,))
         panel_ch = self.ctx.guild.get_channel(config['panel_channel_id'])
@@ -364,7 +411,8 @@ class TicketCog(commands.Cog, name="Ticket System"):
         name="Name shown on the button/option (e.g. Support, Sales).",
         emoji="Emoji to show on the button/option (optional).",
         roles="Mention the staff role(s) to ping/give access, separated by spaces (optional).",
-        style="Button color (only used for button-style panels)."
+        style="Button color (only used for button-style panels).",
+        category="Optional: an EXISTING Discord category to reuse for this ticket type, instead of creating a new one."
     )
     @app_commands.choices(style=[
         app_commands.Choice(name="Grey", value=discord.ButtonStyle.secondary.value),
@@ -372,7 +420,7 @@ class TicketCog(commands.Cog, name="Ticket System"):
         app_commands.Choice(name="Green", value=discord.ButtonStyle.success.value),
         app_commands.Choice(name="Red", value=discord.ButtonStyle.danger.value),
     ])
-    async def category_add(self, ctx, name: str, emoji: str = None, roles: str = None, style: app_commands.Choice[int] = None):
+    async def category_add(self, ctx, name: str, emoji: str = None, roles: str = None, style: app_commands.Choice[int] = None, category: discord.CategoryChannel = None):
         await ctx.defer(ephemeral=True)
         guild = ctx.guild
         config = self.db.fetchone("SELECT * FROM guild_configs WHERE guild_id=?", (guild.id,))
@@ -388,10 +436,15 @@ class TicketCog(commands.Cog, name="Ticket System"):
 
         role_ids = re.findall(r'<@&(\d+)>', roles) if roles else []
 
-        try:
-            cat_ch = await guild.create_category(f"{name} Tickets", overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=False)})
-        except discord.Forbidden:
-            return await ctx.send(f"{ERROR_EMOJI} I don't have permission to create categories.", ephemeral=True)
+        # --- NEW: if the user picked an existing Discord category, reuse it instead of creating one.
+        # This is how you make e.g. 3 different ticket types all land in the same Discord category.
+        if category is not None:
+            cat_ch = category
+        else:
+            try:
+                cat_ch = await guild.create_category(f"{name} Tickets", overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=False)})
+            except discord.Forbidden:
+                return await ctx.send(f"{ERROR_EMOJI} I don't have permission to create categories.", ephemeral=True)
 
         button_style = style.value if style else discord.ButtonStyle.secondary.value
         self.db.execute(
@@ -401,7 +454,7 @@ class TicketCog(commands.Cog, name="Ticket System"):
 
         if await self.refresh_panel(guild) is None:
             return await ctx.send(f"{SUCCESS_EMOJI} Category `{name}` created, but I couldn't find the panel message to update it live — try re-running `/ticket setup` if the panel is missing.", ephemeral=True)
-        await ctx.send(f"{SUCCESS_EMOJI} Category `{name}` added — the panel has been updated.", ephemeral=True)
+        await ctx.send(f"{SUCCESS_EMOJI} Category `{name}` added (using Discord category **{cat_ch.name}**) — the panel has been updated.", ephemeral=True)
 
     @category.command(name="remove", description="Remove a category/button from the ticket panel.")
     @commands.has_permissions(manage_guild=True)
@@ -414,7 +467,14 @@ class TicketCog(commands.Cog, name="Ticket System"):
             return await ctx.send(f"{ERROR_EMOJI} No category named `{name}` found.", ephemeral=True)
 
         self.db.execute("DELETE FROM ticket_categories WHERE category_id=?", (cat['category_id'],))
-        if disc_cat := guild.get_channel(cat['discord_category_id']):
+
+        # Only auto-delete the Discord category if no other ticket type is still using it
+        # (important now that categories can be shared between multiple ticket types).
+        still_used = self.db.fetchone(
+            "SELECT 1 FROM ticket_categories WHERE guild_id=? AND discord_category_id=?",
+            (guild.id, cat['discord_category_id'])
+        )
+        if not still_used and (disc_cat := guild.get_channel(cat['discord_category_id'])):
             try: await disc_cat.delete()
             except: pass
 
@@ -625,3 +685,4 @@ class ClosedTicketActionsView(discord.ui.View):
 
 async def setup(bot):
     await bot.add_cog(TicketCog(bot))
+    
