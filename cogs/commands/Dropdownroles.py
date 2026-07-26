@@ -11,27 +11,56 @@ DB_PATH = "dropdownroles.db"
 
 
 class DropdownRolesDB:
+    # --- Schema definition: single source of truth for expected columns/types. ---
+    # Whenever a new column needs to be added in a future update, add it HERE
+    # (and nowhere else) - the migration in _migrate() will take care of adding
+    # it to any database file that was created before that update, the same
+    # way it's handled in the welcomer cog.
+    MENUS_SCHEMA = {
+        "message_id": "INTEGER PRIMARY KEY",
+        "guild_id": "INTEGER",
+        "channel_id": "INTEGER",
+        "custom_id": "TEXT",
+        "placeholder": "TEXT",
+        "max_values": "INTEGER DEFAULT 1",
+    }
+    OPTIONS_SCHEMA = {
+        "message_id": "INTEGER",
+        "role_id": "INTEGER",
+        "label": "TEXT",
+        "description": "TEXT",
+        "emoji": "TEXT",
+    }
+
     def __init__(self):
         with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS dropdown_menus (
-                    message_id INTEGER PRIMARY KEY,
-                    guild_id INTEGER,
-                    channel_id INTEGER,
-                    custom_id TEXT,
-                    placeholder TEXT,
-                    max_values INTEGER DEFAULT 1
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS dropdown_options (
-                    message_id INTEGER,
-                    role_id INTEGER,
-                    label TEXT,
-                    description TEXT,
-                    emoji TEXT
-                )
-            """)
+            menus_cols = ", ".join(f"{name} {ctype}" for name, ctype in self.MENUS_SCHEMA.items())
+            conn.execute(f"CREATE TABLE IF NOT EXISTS dropdown_menus ({menus_cols})")
+
+            options_cols = ", ".join(f"{name} {ctype}" for name, ctype in self.OPTIONS_SCHEMA.items())
+            conn.execute(f"CREATE TABLE IF NOT EXISTS dropdown_options ({options_cols})")
+
+            self._migrate(conn, "dropdown_menus", self.MENUS_SCHEMA)
+            self._migrate(conn, "dropdown_options", self.OPTIONS_SCHEMA)
+
+    def _migrate(self, conn, table_name, schema):
+        """
+        Ensures an existing (pre-update) table has every column defined in its
+        schema dict. CREATE TABLE IF NOT EXISTS does nothing if the table
+        already exists, so if a new column is added to a schema in a future
+        update, rows saved by an older version of the bot would be missing
+        it, and any query touching that column would break after an update.
+        This checks the real columns via PRAGMA and ALTERs in whatever is
+        missing, so old data keeps working after a restart/update.
+        """
+        existing_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+        missing_columns = [name for name in schema if name not in existing_columns]
+        for name in missing_columns:
+            # PRIMARY KEY columns can't be added via ALTER TABLE, but that's
+            # fine here since the PK column is always part of the original
+            # CREATE TABLE and will already exist.
+            col_type = schema[name].replace("PRIMARY KEY", "").strip()
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {col_type}")
 
     def create_menu(self, message_id, guild_id, channel_id, custom_id, placeholder, max_values=1):
         with sqlite3.connect(DB_PATH) as conn:
