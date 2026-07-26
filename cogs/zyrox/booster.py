@@ -12,5 +12,5 @@ class __boost(commands .Cog ):
               return emoji ,label ,description 
     @commands .group ()
     async def __Boost__ (self ,ctx :commands .Context ):
-        """`boost thumbnail` , `boost image` , `boost autodel` , `boost title` , `boost description` , `boost color` , `boost footer` , `boost footericon` , `boost author` , `boost authoricon` , `boost timestamp` , `boost message` , `boost embed` , `boost ping` , `boost channel add` , `boost channel remove` , `boost preview` , `boost test` , `boost config` , `boost reset` , `boostrole add` , `boostrole remove` , `boostrole config` , `boostrole reset`"""
+        """`boost setup` (full step-by-step wizard) , `boost thumbnail` , `boost image` , `boost autodel` , `boost title` , `boost description` , `boost color` , `boost footer` , `boost footericon` , `boost author` , `boost authoricon` , `boost timestamp` , `boost message` , `boost embed` , `boost ping` , `boost channel add` , `boost channel remove` , `boost preview` , `boost test` , `boost config` , `boost reset` , `boostrole add` , `boostrole remove` , `boostrole config` , `boostrole reset`"""
         pass
