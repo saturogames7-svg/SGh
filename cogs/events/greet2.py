@@ -1,15 +1,22 @@
 import discord
-import aiosqlite
 import json
 import re
 import asyncio
 from discord.ext import commands
+from utils.welcome_db import welcome_db
+
 
 class greet(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.join_queue = {}
         self.processing = set()
+
+    async def cog_load(self):
+        # Table creation/migration is idempotent, so calling it here too
+        # (Welcomer's cog_load also calls it) is safe regardless of which
+        # of the two cogs happens to load first.
+        await welcome_db.initialize()
 
     async def safe_format(self, text, placeholders):
         placeholders_lower = {k.lower(): v for k, v in placeholders.items()}
@@ -31,12 +38,11 @@ class greet(commands.Cog):
         try:
             while self.join_queue[guild.id]:
                 member = self.join_queue[guild.id].pop(0)
-                async with aiosqlite.connect("db/welcome.db") as db:
-                    async with db.execute(
-                        "SELECT welcome_type, welcome_message, channel_id, embed_data, auto_delete_duration FROM welcome WHERE guild_id = ?",
-                        (guild.id,)
-                    ) as cursor:
-                        row = await cursor.fetchone()
+
+                row = await welcome_db.get_columns(
+                    ["welcome_type", "welcome_message", "channel_id", "embed_data", "auto_delete_duration"],
+                    guild.id
+                )
 
                 if row is None:
                     continue
@@ -132,3 +138,4 @@ class greet(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(greet(bot))
+    
