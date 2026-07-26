@@ -5,8 +5,9 @@ from discord.ui import View, Select, Button
 import asyncio
 import re
 import json
+import traceback
 from utils.Tools import *
-from utils.welcome_db import welcome_db
+from utils.welcome_db import get_welcome_db
 
 class VariableButton(Button):
     def __init__(self, author):
@@ -31,7 +32,6 @@ class VariableButton(Button):
             "{server_membercount}": "The server's total member count.",
             "{server_icon}": "The server's icon URL."
         }
-        
 
         embed = discord.Embed(
             title="Available Placeholders",
@@ -50,12 +50,18 @@ class Welcomer(commands.Cog):
         self.bot = bot
 
     async def cog_load(self):
-        # Table creation moved here from __init__ (was fire-and-forget via
-        # bot.loop.create_task with a local aiosqlite file before). This is
-        # now properly awaited by discord.py during cog load, and is
-        # idempotent so it's safe even though greet2.py's cog_load also
-        # calls it.
-        await welcome_db.initialize()
+        # NOTE: previously __init__ did self.bot.loop.create_task(self._create_table()),
+        # a fire-and-forget sync-context task. That's replaced with cog_load,
+        # which discord.py awaits properly and which is guaranteed to run
+        # inside a live event loop (needed for get_client()/Turso).
+        try:
+            self.db = await get_welcome_db()
+        except Exception:
+            print("=" * 60)
+            print("[Welcomer] FAILED inside cog_load() (Turso table setup):")
+            traceback.print_exc()
+            print("=" * 60)
+            raise
 
     @commands.hybrid_group(invoke_without_command=True, name="greet", help="Shows all the greet commands.")
     @blacklist_check()
@@ -72,13 +78,13 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_setup(self, ctx):
-        already_exists = await welcome_db.exists(ctx.guild.id)
+        row = await self.db.fetchone("SELECT * FROM welcome WHERE guild_id = ?", (ctx.guild.id,))
 
-        if already_exists:
+        if row:
             error = discord.Embed(description=f"A welcome message has already been set in {ctx.guild.name}. Use `{ctx.prefix}greet reset` to reconfigure.", color=0xFF0000)
             error.set_author(name="Error", icon_url="https://cdn.discordapp.com/emojis/1294218790082711553.png")
             return await ctx.send(embed=error)
-            
+
         options_view = View(timeout=600)
 
         async def option_callback(interaction: discord.Interaction, button: Button):
@@ -90,7 +96,7 @@ class Welcomer(commands.Cog):
             if button.custom_id == "simple":
                 await interaction.message.delete()
                 await self.simple_setup(ctx)
-                
+
             elif button.custom_id == "embed":
                 await interaction.message.delete()
                 await self.embed_setup(ctx)
@@ -127,7 +133,6 @@ class Welcomer(commands.Cog):
         )
 
         embed.set_footer(text="Click the buttons below to choose the welcome message type.", icon_url=self.bot.user.display_avatar.url)
-        
 
         await ctx.send(embed=embed, view=options_view)
 
@@ -159,7 +164,6 @@ class Welcomer(commands.Cog):
                 return str(placeholders_lower.get(var_name, f"{{{var_name}}}"))
 
             return re.sub(r"\{(\w+)\}", replace_var, text or "")
-            
 
         async def update_preview(content):
             preview = safe_format(content)
@@ -174,7 +178,7 @@ class Welcomer(commands.Cog):
                 await interaction.response.send_message("You cannot interact with this setup.", ephemeral=True)
                 return
             if message_content:
-                await welcome_db.save_welcome_data(ctx.guild.id, "simple", message_content[0])
+                await self._save_welcome_data(ctx.guild.id, "simple", message_content[0])
                 await interaction.response.send_message(f"{TICK}> Welcome message setup completed!")
                 for item in setup_view.children:
                     item.disabled = True
@@ -222,6 +226,22 @@ class Welcomer(commands.Cog):
         except asyncio.TimeoutError:
             await ctx.send("Setup timed out.")
 
+    async def _save_welcome_data(self, guild_id, welcome_type, message, embed_data=None):
+        # UPDATE-if-exists / INSERT-if-not, so columns not passed here (like
+        # channel_id or auto_delete_duration) aren't wiped if a row exists.
+        exists = await self.db.fetchone("SELECT 1 FROM welcome WHERE guild_id = ?", (guild_id,))
+
+        if exists:
+            await self.db.execute(
+                "UPDATE welcome SET welcome_type = ?, welcome_message = ?, embed_data = ? WHERE guild_id = ?",
+                (welcome_type, message, json.dumps(embed_data) if embed_data else None, guild_id)
+            )
+        else:
+            await self.db.execute(
+                "INSERT INTO welcome (guild_id, welcome_type, welcome_message, embed_data) VALUES (?, ?, ?, ?)",
+                (guild_id, welcome_type, message, json.dumps(embed_data) if embed_data else None)
+            )
+
     async def embed_setup(self, ctx):
         setup_view = View(timeout=600)
         embed_data = {
@@ -253,24 +273,22 @@ class Welcomer(commands.Cog):
         }
 
         def safe_format(text):
-            placeholders_lower = {k.lower(): v for k, v in placeholders.items()}  
+            placeholders_lower = {k.lower(): v for k, v in placeholders.items()}
 
             def replace_var(match):
                 var_name = match.group(1).lower()
                 return str(placeholders_lower.get(var_name, f"{{{var_name}}}"))
 
             return re.sub(r"\{(\w+)\}", replace_var, text or "")
-            
 
         async def update_preview():
             content = safe_format(embed_data["message"]) or "Message Content."
             embed = discord.Embed(
-    title=safe_format(embed_data["title"]) or "",
-    description=safe_format(embed_data["description"]) or "```Customize your welcome embed, take help of variables.```",
-    color=discord.Color(embed_data["color"]) if embed_data["color"] else discord.Color(0x2f3136)
+                title=safe_format(embed_data["title"]) or "",
+                description=safe_format(embed_data["description"]) or "```Customize your welcome embed, take help of variables.```",
+                color=discord.Color(embed_data["color"]) if embed_data["color"] else discord.Color(0x2f3136)
             )
 
-            
             if embed_data["footer_text"]:
                 embed.set_footer(text=safe_format(embed_data["footer_text"]), icon_url=safe_format(embed_data["footer_icon"]) or None)
             if embed_data["author_name"]:
@@ -362,7 +380,7 @@ class Welcomer(commands.Cog):
                 await interaction.response.send_message("Please provide at least a title or an description before submitting.", ephemeral=True)
                 return
 
-            await welcome_db.save_welcome_data(ctx.guild.id, "embed", embed_data["message"] or "", embed_data)
+            await self._save_welcome_data(ctx.guild.id, "embed", embed_data["message"] or "", embed_data)
             await interaction.response.send_message(f"{TICK}> Embed welcome message setup completed!")
 
             for item in setup_view.children:
@@ -394,13 +412,13 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_reset(self, ctx):
-        is_set_up = await welcome_db.exists(ctx.guild.id)
+        is_set_up = await self.db.fetchone("SELECT 1 FROM welcome WHERE guild_id = ?", (ctx.guild.id,))
 
-        if not is_set_up: 
+        if not is_set_up:
             error = discord.Embed(description=f"No welcome message has been set for {ctx.guild.name}! Please set a welcome message first using `{ctx.prefix}greet setup`", color=0xFF0000)
             error.set_author(name="Greet is not configured!", icon_url="https://cdn.discordapp.com/emojis/1294218790082711553.png")
             return await ctx.send(embed=error)
-            
+
         embed = discord.Embed(
             title="Are you sure?",
             description="This will remove all welcome configurations & data related to welcome messages for this server!",
@@ -415,7 +433,7 @@ class Welcomer(commands.Cog):
                 await interaction.response.send_message("Only the command author can confirm this action.", ephemeral=True)
                 return
 
-            await welcome_db.delete_guild(ctx.guild.id)
+            await self.db.execute("DELETE FROM welcome WHERE guild_id = ?", (ctx.guild.id,))
 
             embed.color = discord.Color(0xFF0000)
             embed.title = f"{TICK}> Success"
@@ -440,7 +458,6 @@ class Welcomer(commands.Cog):
         view.add_item(no_button)
 
         await ctx.send(embed=embed, view=view)
-        
 
     @greet.command(name="channel", help="Sets the channel where welcome messages will be sent.")
     @blacklist_check()
@@ -449,9 +466,9 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_channel(self, ctx):
-        result = await welcome_db.get_columns(["welcome_type", "channel_id"], ctx.guild.id)
-        welcome_message = result[0] if result else None
-        welcome_channel = ctx.guild.get_channel(result[1]) if result and result[1] else None
+        result = await self.db.fetchone("SELECT welcome_type, channel_id FROM welcome WHERE guild_id = ?", (ctx.guild.id,))
+        welcome_message = result['welcome_type'] if result else None
+        welcome_channel = ctx.guild.get_channel(result['channel_id']) if result and result['channel_id'] else None
 
         if not welcome_message:
             error = discord.Embed(description=f"No welcome message has been set for {ctx.guild.name}! Please set a welcome message first using `{ctx.prefix}greet setup`", color=0xFF0000)
@@ -481,7 +498,7 @@ class Welcomer(commands.Cog):
                 selected_channel_id = int(select_menu.values[0])
                 selected_channel = ctx.guild.get_channel(selected_channel_id)
 
-                await welcome_db.update_channel(ctx.guild.id, selected_channel_id)
+                await self.db.execute("UPDATE welcome SET channel_id = ? WHERE guild_id = ?", (selected_channel_id, ctx.guild.id))
 
                 embed.description = f"Current Welcome Channel: {selected_channel.mention}"
                 await interaction.response.edit_message(embed=embed, view=None)
@@ -526,8 +543,6 @@ class Welcomer(commands.Cog):
 
         await ctx.send(embed=embed, view=generate_view(current_page))
 
-
-
     @greet.command(name="test", help="Sends a test welcome message to preview the setup.")
     @blacklist_check()
     @ignore_check()
@@ -535,7 +550,7 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_test(self, ctx):
-        row = await welcome_db.get_columns(["welcome_type", "welcome_message", "channel_id", "embed_data"], ctx.guild.id)
+        row = await self.db.fetchone("SELECT welcome_type, welcome_message, channel_id, embed_data FROM welcome WHERE guild_id = ?", (ctx.guild.id,))
 
         if row is None:
             error = discord.Embed(description=f"No welcome message has been set for {ctx.guild.name}! Please set a welcome message first using `{ctx.prefix}greet setup`", color=0xFF0000)
@@ -543,7 +558,10 @@ class Welcomer(commands.Cog):
             await ctx.send(embed=error)
             return
 
-        welcome_type, welcome_message, channel_id, embed_data = row
+        welcome_type = row['welcome_type']
+        welcome_message = row['welcome_message']
+        channel_id = row['channel_id']
+        embed_data = row['embed_data']
         welcome_channel = self.bot.get_channel(channel_id)
 
         if not welcome_channel:
@@ -568,30 +586,27 @@ class Welcomer(commands.Cog):
         }
 
         def safe_format(text):
-            placeholders_lower = {k.lower(): v for k, v in placeholders.items()}  
+            placeholders_lower = {k.lower(): v for k, v in placeholders.items()}
 
             def replace_var(match):
-                var_name = match.group(1).lower()  
+                var_name = match.group(1).lower()
                 return str(placeholders_lower.get(var_name, f"{{{var_name}}}"))
 
             return re.sub(r"\{(\w+)\}", replace_var, text or "")
-            
 
         if welcome_type == "simple" and welcome_message:
             await welcome_channel.send(safe_format(welcome_message))
 
         elif welcome_type == "embed" and embed_data:
             try:
-                embed_info = json.loads(embed_data) 
+                embed_info = json.loads(embed_data)
                 color_value = embed_info.get("color", None)
 
-                
                 embed_color = 0x2f3136
 
-                
                 if color_value and isinstance(color_value, str) and color_value.startswith("#"):
                     embed_color = discord.Color(int(color_value.lstrip("#"), 16))
-                elif isinstance(color_value, int): 
+                elif isinstance(color_value, int):
                     embed_color = discord.Color(color_value)
 
             except (ValueError, SyntaxError, json.JSONDecodeError):
@@ -605,7 +620,6 @@ class Welcomer(commands.Cog):
                 color=embed_color
             )
             embed.timestamp = discord.utils.utcnow()
-
 
             if embed_info.get("footer_text"):
                 embed.set_footer(
@@ -624,8 +638,6 @@ class Welcomer(commands.Cog):
 
             await welcome_channel.send(content=content, embed=embed)
 
-
-
     @greet.command(name="config", help="Shows the current welcome configuration.")
     @blacklist_check()
     @ignore_check()
@@ -633,10 +645,14 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_config(self, ctx):
-        row = await welcome_db.get_row(ctx.guild.id)
+        row = await self.db.fetchone("SELECT * FROM welcome WHERE guild_id = ?", (ctx.guild.id,))
 
         if row:
-            _, welcome_type, welcome_message, channel_id, embed_data, auto_delete_duration = row
+            welcome_type = row['welcome_type']
+            welcome_message = row['welcome_message']
+            channel_id = row['channel_id']
+            embed_data = row['embed_data']
+            auto_delete_duration = row['auto_delete_duration']
             response_type = "Simple" if welcome_type == "simple" else "Embed"
 
             embed = discord.Embed(
@@ -660,10 +676,10 @@ class Welcomer(commands.Cog):
 
             greet_channel = self.bot.get_channel(channel_id)
             channel_display = greet_channel.mention if greet_channel else "None"
-            auto_delete_duration = f"{auto_delete_duration} seconds" if auto_delete_duration else "None"
+            auto_delete_display = f"{auto_delete_duration} seconds" if auto_delete_duration else "None"
 
             embed.add_field(name="Greet Channel", value=channel_display, inline=False)
-            embed.add_field(name="Auto Delete Duration", value=auto_delete_duration, inline=False)
+            embed.add_field(name="Auto Delete Duration", value=auto_delete_display, inline=False)
             await ctx.send(embed=embed)
         else:
             error = discord.Embed(
@@ -673,7 +689,6 @@ class Welcomer(commands.Cog):
             error.set_author(name="Greet is not configured!", icon_url="https://cdn.discordapp.com/emojis/1294218790082711553.png")
             await ctx.send(embed=error)
 
-
     @greet.command(name="autodelete", aliases=["autodel"], help="Sets the auto-delete duration for the welcome message.")
     @blacklist_check()
     @ignore_check()
@@ -681,7 +696,7 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_autodelete(self, ctx, time: str):
-        
+
         if time.endswith("s"):
             seconds = int(time[:-1])
             if 3 <= seconds <= 300:
@@ -692,7 +707,7 @@ class Welcomer(commands.Cog):
         elif time.endswith("m"):
             minutes = int(time[:-1])
             if 1 <= minutes <= 5:
-                auto_delete_duration = minutes * 60  
+                auto_delete_duration = minutes * 60
             else:
                 await ctx.send("Auto delete time should be between 1 minute and 5 minutes.")
                 return
@@ -700,11 +715,9 @@ class Welcomer(commands.Cog):
             await ctx.send("Invalid time format. Please use 's' for seconds and 'm' for minutes.")
             return
 
-        await welcome_db.update_auto_delete(ctx.guild.id, auto_delete_duration)
+        await self.db.execute("UPDATE welcome SET auto_delete_duration = ? WHERE guild_id = ?", (auto_delete_duration, ctx.guild.id))
 
         await ctx.send(f"{ZTICK} Auto delete duration has been set to **{auto_delete_duration}** seconds.")
-
-
 
     @greet.command(name="edit", help="Edits the current welcome message settings for the server.")
     @blacklist_check()
@@ -713,7 +726,7 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_edit(self, ctx):
-        row = await welcome_db.get_columns(["welcome_type", "welcome_message", "embed_data"], ctx.guild.id)
+        row = await self.db.fetchone("SELECT welcome_type, welcome_message, embed_data FROM welcome WHERE guild_id = ?", (ctx.guild.id,))
 
         if row is None:
             error = discord.Embed(description=f"No welcome message has been set for {ctx.guild.name}! Please set a welcome message first using `{ctx.prefix}greet setup`", color=0xFF0000)
@@ -721,9 +734,11 @@ class Welcomer(commands.Cog):
             await ctx.send(embed=error)
             return
 
-        welcome_type, welcome_message, embed_data = row
+        welcome_type = row['welcome_type']
+        welcome_message = row['welcome_message']
+        embed_data = row['embed_data']
 
-        cancel_flag = False  
+        cancel_flag = False
 
         if welcome_type == "simple":
             embed = discord.Embed(
@@ -740,8 +755,8 @@ class Welcomer(commands.Cog):
                     await interaction.response.send_message("You are not authorized to cancel the setup.", ephemeral=True)
                     return
                 await interaction.response.send_message("Setup has been canceled.", ephemeral=True)
-                cancel_flag = True  
-                view.clear_items()  
+                cancel_flag = True
+                view.clear_items()
                 await interaction.message.edit(embed=embed, view=view)
 
             cancel_button.callback = cancel_button_callback
@@ -758,12 +773,11 @@ class Welcomer(commands.Cog):
                         check=lambda m: m.author == ctx.author and m.channel == ctx.channel,
                         timeout=600
                     )
-                    if cancel_flag:  
+                    if cancel_flag:
                         await ctx.send("Setup was canceled. No changes were made.")
                         return
                     await new_message.delete()
-
-                    await welcome_db.update_welcome_message(ctx.guild.id, new_message.content)
+                    await self.db.execute("UPDATE welcome SET welcome_message = ? WHERE guild_id = ?", (new_message.content, ctx.guild.id))
 
                     embed.description = f"**Response Type:** Simple\n**Message Content:** {new_message.content}"
                     edit_button.disabled = True
@@ -780,7 +794,7 @@ class Welcomer(commands.Cog):
             view.add_item(edit_button)
             view.add_item(VariableButton(ctx.author))
             view.add_item(cancel_button)
-            
+
             await ctx.send(embed=embed, view=view)
 
         elif welcome_type == "embed":
@@ -810,8 +824,8 @@ class Welcomer(commands.Cog):
                     await interaction.response.send_message("You are not authorized to cancel the setup.", ephemeral=True)
                     return
                 await interaction.response.send_message("Setup has been canceled.", ephemeral=True)
-                cancel_flag = True  
-                view.clear_items()  
+                cancel_flag = True
+                view.clear_items()
                 await interaction.message.edit(embed=embed, view=view)
 
             cancel_button.callback = cancel_button_callback
@@ -825,7 +839,7 @@ class Welcomer(commands.Cog):
                 selected_option = select_menu.values[0]
                 await interaction.response.defer()
 
-                while not cancel_flag:  
+                while not cancel_flag:
                     try:
                         if selected_option == "message":
                             await ctx.send("Enter the welcome message content:")
@@ -850,7 +864,7 @@ class Welcomer(commands.Cog):
                                 embed_data_json["color"] = int(color_code.lstrip("#"), 16)
                             else:
                                 await ctx.send("Invalid color code. Please enter a valid hex color.")
-                                continue  
+                                continue
 
                         elif selected_option in ["footer_text", "footer_icon", "author_name", "author_icon", "thumbnail", "image"]:
                             await ctx.send(f"Enter the URL or text for {selected_option.replace('_', ' ')}:")
@@ -861,16 +875,16 @@ class Welcomer(commands.Cog):
                                     embed_data_json[selected_option] = url_or_text
                                 else:
                                     await ctx.send("Invalid URL. Please enter a valid image URL or a supported placeholder ({user_avatar} or {server_icon}).")
-                                    continue  
+                                    continue
                             else:
                                 embed_data_json[selected_option] = url_or_text
 
-                        await welcome_db.update_embed_data(ctx.guild.id, embed_data_json)
+                        await self.db.execute("UPDATE welcome SET embed_data = ? WHERE guild_id = ?", (json.dumps(embed_data_json), ctx.guild.id))
 
                         embed.description = f"**Response Type:** Embed\n**Embed Data:**\n```{json.dumps(embed_data_json, indent=4)}```"
                         await interaction.message.edit(embed=embed, view=None)
                         await ctx.send("Embed data has been successfully updated.")
-                        break 
+                        break
                     except asyncio.TimeoutError:
                         await ctx.send("You took too long to respond.")
                         break
@@ -883,6 +897,9 @@ class Welcomer(commands.Cog):
             view.add_item(select_menu)
             view.add_item(VariableButton(ctx.author))
             view.add_item(cancel_button)
-            
+
             await ctx.send(embed=embed, view=view)
-            
+
+async def setup(bot):
+    await bot.add_cog(Welcomer(bot))
+    
