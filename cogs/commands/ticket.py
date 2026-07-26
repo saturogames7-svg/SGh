@@ -28,6 +28,7 @@ TRANSCRIPT_EMOJI = ZMODULE
 
 # --- Constants ---
 MAX_CATEGORIES = 15
+MAX_PANELS_PER_GUILD = 10
 TICKET_LIMIT_PER_USER = 3
 
 
@@ -36,10 +37,30 @@ class TicketDatabase:
     # Single source of truth for expected columns/types per table.
     # Adding a column later: add it HERE only, _migrate() adds it to
     # any pre-existing remote table automatically.
+    #
+    # NOTE (multi-panel support): guild_configs used to ALSO store the
+    # single panel's channel/message/embed data directly (one row per
+    # guild_id PK == only one panel possible). That data now lives in
+    # its own ticket_panels table (one row PER PANEL, panel_id PK,
+    # guild_id is a plain non-unique column so a guild can have many
+    # rows/panels). guild_configs keeps only true guild-wide settings.
+    #
+    # IMPORTANT for existing Turso databases: the OLD panel_* / embed_*
+    # columns physically still exist on the remote guild_configs table
+    # (CREATE TABLE IF NOT EXISTS never removes columns). We don't touch
+    # or drop them - _migrate_legacy_panels() below reads them once on
+    # startup to copy any existing panel into the new ticket_panels
+    # table, then leaves them alone. Nothing destructive ever happens.
     GUILD_CONFIGS_SCHEMA = {
         "guild_id": "INTEGER PRIMARY KEY",
-        "panel_channel_id": "INTEGER",
         "logging_channel_id": "INTEGER",
+        "closed_category_id": "INTEGER",
+    }
+    TICKET_PANELS_SCHEMA = {
+        "panel_id": "INTEGER PRIMARY KEY AUTOINCREMENT",
+        "guild_id": "INTEGER NOT NULL",
+        "panel_name": "TEXT",
+        "panel_channel_id": "INTEGER",
         "panel_message_id": "INTEGER",
         "panel_type": "TEXT",
         "embed_title": "TEXT",
@@ -47,11 +68,11 @@ class TicketDatabase:
         "embed_color": "INTEGER",
         "embed_image_url": "TEXT",
         "embed_thumbnail_url": "TEXT",
-        "closed_category_id": "INTEGER",
     }
     TICKET_CATEGORIES_SCHEMA = {
         "category_id": "INTEGER PRIMARY KEY AUTOINCREMENT",
         "guild_id": "INTEGER",
+        "panel_id": "INTEGER",  # NEW: which panel this category/button belongs to
         "name": "TEXT NOT NULL",
         "emoji": "TEXT",
         "notified_roles": "TEXT",
@@ -82,6 +103,9 @@ class TicketDatabase:
         guild_cols = ", ".join(f"{n} {t}" for n, t in self.GUILD_CONFIGS_SCHEMA.items())
         await self.client.execute(f"CREATE TABLE IF NOT EXISTS guild_configs ({guild_cols})")
 
+        panel_cols = ", ".join(f"{n} {t}" for n, t in self.TICKET_PANELS_SCHEMA.items())
+        await self.client.execute(f"CREATE TABLE IF NOT EXISTS ticket_panels ({panel_cols})")
+
         cat_cols = ", ".join(f"{n} {t}" for n, t in self.TICKET_CATEGORIES_SCHEMA.items())
         await self.client.execute(f"CREATE TABLE IF NOT EXISTS ticket_categories ({cat_cols})")
 
@@ -97,16 +121,71 @@ class TicketDatabase:
         )
 
         await self._migrate("guild_configs", self.GUILD_CONFIGS_SCHEMA)
+        await self._migrate("ticket_panels", self.TICKET_PANELS_SCHEMA)
         await self._migrate("ticket_categories", self.TICKET_CATEGORIES_SCHEMA)
         await self._migrate("open_tickets", self.OPEN_TICKETS_SCHEMA)
+
+        # One-time, idempotent, additive migration for guilds that set up
+        # a panel under the OLD single-panel schema before this update.
+        await self._migrate_legacy_panels()
 
     async def _migrate(self, table_name, schema):
         result = await self.client.execute(f"PRAGMA table_info({table_name})")
         existing_columns = {row[1] for row in result.rows}
         missing_columns = [name for name in schema if name not in existing_columns]
         for name in missing_columns:
-            col_type = schema[name].replace("PRIMARY KEY", "").replace("AUTOINCREMENT", "").strip()
+            col_type = schema[name].replace("PRIMARY KEY", "").replace("AUTOINCREMENT", "").replace("NOT NULL", "").strip()
             await self.client.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {col_type}")
+
+    async def _migrate_legacy_panels(self):
+        """
+        Older versions of this cog stored one panel directly on
+        guild_configs (guild_id was the PK, so only one panel per guild
+        was possible). Those legacy columns still physically exist on
+        the remote Turso table for any guild that ran /ticket setup
+        before this update. This copies that single panel + its
+        categories into the new multi-panel tables, once, safely.
+
+        Safe to run on every startup: it only acts on guilds that still
+        have unmigrated categories (panel_id IS NULL), so once a guild
+        is migrated this becomes a no-op for it forever after.
+        """
+        result = await self.client.execute("PRAGMA table_info(guild_configs)")
+        legacy_columns = {row[1] for row in result.rows}
+        if "panel_channel_id" not in legacy_columns:
+            return  # fresh install, nothing legacy to migrate
+
+        legacy_configs = await self.fetchall(
+            "SELECT guild_id, panel_channel_id, panel_message_id, panel_type, "
+            "embed_title, embed_description, embed_color, embed_image_url, embed_thumbnail_url "
+            "FROM guild_configs WHERE panel_channel_id IS NOT NULL"
+        )
+        for cfg in legacy_configs:
+            unmigrated = await self.fetchone(
+                "SELECT 1 FROM ticket_categories WHERE guild_id=? AND panel_id IS NULL",
+                (cfg["guild_id"],)
+            )
+            if not unmigrated:
+                continue  # already migrated (or this guild never had categories)
+
+            await self.execute(
+                "INSERT INTO ticket_panels (guild_id, panel_name, panel_channel_id, panel_message_id, "
+                "panel_type, embed_title, embed_description, embed_color, embed_image_url, embed_thumbnail_url) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (cfg["guild_id"], cfg["embed_title"] or "Support", cfg["panel_channel_id"], cfg["panel_message_id"],
+                 cfg["panel_type"], cfg["embed_title"], cfg["embed_description"], cfg["embed_color"],
+                 cfg["embed_image_url"], cfg["embed_thumbnail_url"])
+            )
+            new_panel = await self.fetchone(
+                "SELECT panel_id FROM ticket_panels WHERE guild_id=? AND panel_channel_id=? "
+                "ORDER BY panel_id DESC LIMIT 1",
+                (cfg["guild_id"], cfg["panel_channel_id"])
+            )
+            if new_panel:
+                await self.execute(
+                    "UPDATE ticket_categories SET panel_id=? WHERE guild_id=? AND panel_id IS NULL",
+                    (new_panel["panel_id"], cfg["guild_id"])
+                )
 
     @staticmethod
     def _row_to_dict(columns, row):
@@ -161,7 +240,11 @@ async def get_or_create_closed_category(db, guild):
     overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
     try:
         cat = await guild.create_category("Closed Tickets", overwrites=overwrites)
-        await db.execute("UPDATE guild_configs SET closed_category_id = ? WHERE guild_id = ?", (cat.id, guild.id))
+        await db.execute(
+            "INSERT INTO guild_configs (guild_id, closed_category_id) VALUES (?,?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET closed_category_id=excluded.closed_category_id",
+            (guild.id, cat.id)
+        )
         return cat
     except Exception:
         return None
@@ -186,9 +269,9 @@ def resolve_existing_category(guild, raw_input):
 
 # --- Setup Views ---
 class EmbedEditorView(discord.ui.View):
-    def __init__(self, cog, ctx, panel_channel, panel_type):
+    def __init__(self, cog, ctx, panel_channel, panel_type, panel_name):
         super().__init__(timeout=600)
-        self.cog, self.ctx, self.panel_channel, self.panel_type = cog, ctx, panel_channel, panel_type
+        self.cog, self.ctx, self.panel_channel, self.panel_type, self.panel_name = cog, ctx, panel_channel, panel_type, panel_name
         self.message = None
         self.embed_data = {"title": "Support Tickets", "description": "Click a button or select an option below to create a ticket.", "color": EMBED_COLOR}
 
@@ -252,23 +335,29 @@ class EmbedEditorView(discord.ui.View):
         for item in self.children: item.disabled = True
         try: await self.message.edit(view=self)
         except Exception: pass
+
+        # NOTE (multi-panel support): this ALWAYS inserts a brand new row
+        # in ticket_panels - it never overwrites an existing panel, so a
+        # guild can now have many independent panels at once.
         await self.cog.db.execute(
-            "INSERT INTO guild_configs (guild_id, panel_channel_id, panel_type, embed_title, embed_description, embed_color, embed_image_url, embed_thumbnail_url) "
-            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET "
-            "panel_channel_id=excluded.panel_channel_id, panel_type=excluded.panel_type, embed_title=excluded.embed_title, "
-            "embed_description=excluded.embed_description, embed_color=excluded.embed_color, "
-            "embed_image_url=excluded.embed_image_url, embed_thumbnail_url=excluded.embed_thumbnail_url",
-            (self.ctx.guild.id, self.panel_channel.id, self.panel_type, self.embed_data["title"], self.embed_data["description"],
-             self.embed_data["color"], self.embed_data.get("image", {}).get("url"), self.embed_data.get("thumbnail", {}).get("url"))
+            "INSERT INTO ticket_panels (guild_id, panel_name, panel_channel_id, panel_type, embed_title, "
+            "embed_description, embed_color, embed_image_url, embed_thumbnail_url) VALUES (?,?,?,?,?,?,?,?,?)",
+            (self.ctx.guild.id, self.panel_name, self.panel_channel.id, self.panel_type, self.embed_data["title"],
+             self.embed_data["description"], self.embed_data["color"],
+             self.embed_data.get("image", {}).get("url"), self.embed_data.get("thumbnail", {}).get("url"))
         )
-        await CategoryConfigView(self.cog, self.ctx).start(inter)
+        new_panel = await self.cog.db.fetchone(
+            "SELECT panel_id FROM ticket_panels WHERE guild_id=? AND panel_channel_id=? ORDER BY panel_id DESC LIMIT 1",
+            (self.ctx.guild.id, self.panel_channel.id)
+        )
+        await CategoryConfigView(self.cog, self.ctx, new_panel['panel_id']).start(inter)
         self.stop()
 
 
 class CategoryConfigView(discord.ui.View):
-    def __init__(self, cog, ctx):
+    def __init__(self, cog, ctx, panel_id):
         super().__init__(timeout=900)
-        self.cog, self.ctx, self.message, self.categories = cog, ctx, None, []
+        self.cog, self.ctx, self.panel_id, self.message, self.categories = cog, ctx, panel_id, None, []
         # NOTE: previously this called a sync _setup_buttons() that ran a DB
         # query (panel_type) whose result was never actually used anywhere.
         # That query is what caused __init__ to try doing network I/O
@@ -379,8 +468,8 @@ class CategoryConfigView(discord.ui.View):
     async def _finish_setup(self, inter):
         if not self.categories: return await inter.response.send_message("Add at least one category.", ephemeral=True)
         await inter.response.defer()
-        db, guild_id = self.cog.db, self.ctx.guild.id
-        await db.execute("DELETE FROM ticket_categories WHERE guild_id = ?", (guild_id,))
+        db, guild_id, panel_id = self.cog.db, self.ctx.guild.id, self.panel_id
+        await db.execute("DELETE FROM ticket_categories WHERE panel_id = ?", (panel_id,))
         for cat in self.categories:
             existing_id = cat.get("existing_category_id")
             cat_ch = self.ctx.guild.get_channel(existing_id) if existing_id else None
@@ -390,18 +479,18 @@ class CategoryConfigView(discord.ui.View):
                 except Exception:
                     return await inter.followup.send(f"Can't create category for `{cat['name']}`.", ephemeral=True)
             await db.execute(
-                'INSERT INTO ticket_categories (guild_id, name, emoji, notified_roles, button_style, discord_category_id) VALUES (?,?,?,?,?,?)',
-                (guild_id, cat['name'], cat['emoji'], cat['notified_roles'], cat['button_style'], cat_ch.id)
+                'INSERT INTO ticket_categories (guild_id, panel_id, name, emoji, notified_roles, button_style, discord_category_id) VALUES (?,?,?,?,?,?,?)',
+                (guild_id, panel_id, cat['name'], cat['emoji'], cat['notified_roles'], cat['button_style'], cat_ch.id)
             )
-        config = await db.fetchone("SELECT * FROM guild_configs WHERE guild_id=?", (guild_id,))
+        config = await db.fetchone("SELECT * FROM ticket_panels WHERE panel_id=?", (panel_id,))
         panel_ch = self.ctx.guild.get_channel(config['panel_channel_id'])
         panel_embed = discord.Embed(title=config['embed_title'], description=config['embed_description'], color=config['embed_color'])
         if img_url := config['embed_image_url']: panel_embed.set_image(url=img_url)
         if thumb_url := config['embed_thumbnail_url']: panel_embed.set_thumbnail(url=thumb_url)
-        final_view = await self.cog.create_panel_view(guild_id)
+        final_view = await self.cog.create_panel_view(panel_id)
         msg = await panel_ch.send(embed=panel_embed, view=final_view)
-        await db.execute("UPDATE guild_configs SET panel_message_id = ? WHERE guild_id = ?", (msg.id, guild_id))
-        await self.message.edit(content=f"{SUCCESS_EMOJI} Setup complete! Panel sent to {panel_ch.mention}.", view=None, embed=None)
+        await db.execute("UPDATE ticket_panels SET panel_message_id = ? WHERE panel_id = ?", (msg.id, panel_id))
+        await self.message.edit(content=f"{SUCCESS_EMOJI} Setup complete! Panel **{config['panel_name']}** sent to {panel_ch.mention}.", view=None, embed=None)
         self.stop()
 
 
@@ -438,10 +527,11 @@ class TicketCog(commands.Cog, name="Ticket System"):
             raise
 
     async def load_persistent_views(self):
-        # 1) Re-register the main ticket panel.
-        for config in await self.db.fetchall("SELECT guild_id, panel_message_id FROM guild_configs WHERE panel_message_id IS NOT NULL"):
-            if view := await self.create_panel_view(config['guild_id']):
-                self.bot.add_view(view, message_id=config['panel_message_id'])
+        # 1) Re-register EVERY panel for EVERY guild (a guild can now have
+        #    several independent panels, each with its own message).
+        for panel in await self.db.fetchall("SELECT panel_id, panel_message_id FROM ticket_panels WHERE panel_message_id IS NOT NULL"):
+            if view := await self.create_panel_view(panel['panel_id']):
+                self.bot.add_view(view, message_id=panel['panel_message_id'])
 
         # 2) Re-register the action buttons inside every ticket (open or closed)
         #    so Lock/Unlock/Claim/Close and Reopen/Transcript/Delete keep
@@ -456,9 +546,9 @@ class TicketCog(commands.Cog, name="Ticket System"):
                 view = TicketActionsView(self, t['channel_id'], t['category_db_id'])
             self.bot.add_view(view, message_id=t['action_message_id'])
 
-    async def create_panel_view(self, guild_id):
-        config = await self.db.fetchone("SELECT panel_type FROM guild_configs WHERE guild_id=?", (guild_id,))
-        categories = await self.db.fetchall("SELECT * FROM ticket_categories WHERE guild_id=?", (guild_id,))
+    async def create_panel_view(self, panel_id):
+        config = await self.db.fetchone("SELECT panel_type FROM ticket_panels WHERE panel_id=?", (panel_id,))
+        categories = await self.db.fetchall("SELECT * FROM ticket_categories WHERE panel_id=?", (panel_id,))
         if not config or not categories: return None
         view_class = TicketPanelSelect if config['panel_type'] == 'dropdown' else TicketPanelButtons
         view = view_class(self)
@@ -469,11 +559,13 @@ class TicketCog(commands.Cog, name="Ticket System"):
                 view.add_item(discord.ui.Button(label=c['name'], style=discord.ButtonStyle(c['button_style']), emoji=c['emoji'], custom_id=f"create_ticket_{c['category_id']}"))
         return view
 
-    async def refresh_panel(self, guild):
-        """Re-renders the live panel message (embed + buttons/select) after a category or color change."""
-        config = await self.db.fetchone("SELECT * FROM guild_configs WHERE guild_id=?", (guild.id,))
+    async def refresh_panel(self, panel_id):
+        """Re-renders one specific live panel message (embed + buttons/select) after a category or color change."""
+        config = await self.db.fetchone("SELECT * FROM ticket_panels WHERE panel_id=?", (panel_id,))
         if not config or not config['panel_channel_id'] or not config['panel_message_id']:
             return None
+        guild = self.bot.get_guild(config['guild_id'])
+        if not guild: return None
         channel = guild.get_channel(config['panel_channel_id'])
         if not channel: return None
         try:
@@ -483,9 +575,15 @@ class TicketCog(commands.Cog, name="Ticket System"):
         embed = discord.Embed(title=config['embed_title'], description=config['embed_description'], color=config['embed_color'])
         if config['embed_image_url']: embed.set_image(url=config['embed_image_url'])
         if config['embed_thumbnail_url']: embed.set_thumbnail(url=config['embed_thumbnail_url'])
-        view = await self.create_panel_view(guild.id)
+        view = await self.create_panel_view(panel_id)
         await msg.edit(embed=embed, view=view)
         return msg
+
+    async def resolve_panel(self, guild_id, panel_name):
+        """Look up a panel by its friendly name within one guild."""
+        return await self.db.fetchone(
+            "SELECT * FROM ticket_panels WHERE guild_id=? AND panel_name=?", (guild_id, panel_name)
+        )
 
     # NOTE: cog_unload that used to call self.db.close() was removed - the
     # Turso client is shared across every cog (ReactionRoles, DropdownRoles,
@@ -546,21 +644,51 @@ class TicketCog(commands.Cog, name="Ticket System"):
     async def ticket(self, ctx):
         if ctx.invoked_subcommand is None: await ctx.send_help(ctx.command)
 
-    @ticket.command(name="setup", description="Start the interactive setup for the ticket panel.")
+    @ticket.command(name="setup", description="Create a NEW ticket panel (you can have several panels per server).")
     @commands.has_permissions(manage_guild=True)
-    @app_commands.describe(style="The style of the ticket creation panel.", channel="The channel where the ticket panel will be sent.")
+    @app_commands.describe(
+        style="The style of the ticket creation panel.",
+        channel="The channel where this panel will be sent.",
+        panel_name="A short internal name for this panel (e.g. 'Support', 'Careers') - used to pick it later."
+    )
     @app_commands.choices(style=[app_commands.Choice(name="Dropdown Menu", value="dropdown"), app_commands.Choice(name="Buttons", value="button")])
-    async def setup(self, ctx, style: app_commands.Choice[str], channel: discord.TextChannel):
-        await EmbedEditorView(self, ctx, channel, style.value).start(ctx.interaction)
+    async def setup(self, ctx, style: app_commands.Choice[str], channel: discord.TextChannel, panel_name: str):
+        existing = await self.resolve_panel(ctx.guild.id, panel_name)
+        if existing:
+            return await ctx.send(f"{ERROR_EMOJI} A panel named `{panel_name}` already exists. Choose a different name.", ephemeral=True)
 
-    @ticket.group(name="category", description="Add or remove buttons/options from your existing ticket panel.")
+        panel_count = (await self.db.fetchone("SELECT COUNT(*) as n FROM ticket_panels WHERE guild_id=?", (ctx.guild.id,)))['n']
+        if panel_count >= MAX_PANELS_PER_GUILD:
+            return await ctx.send(f"{ERROR_EMOJI} Max of {MAX_PANELS_PER_GUILD} panels per server reached.", ephemeral=True)
+
+        await EmbedEditorView(self, ctx, channel, style.value, panel_name).start(ctx.interaction)
+
+    @ticket.command(name="panels", description="List all ticket panels configured on this server.")
+    @commands.has_permissions(manage_guild=True)
+    async def panels(self, ctx):
+        rows = await self.db.fetchall("SELECT panel_name, panel_channel_id FROM ticket_panels WHERE guild_id=?", (ctx.guild.id,))
+        if not rows:
+            return await ctx.send("No panels have been set up yet. Use `/ticket setup` to create one.", ephemeral=True)
+        lines = []
+        for r in rows:
+            ch = ctx.guild.get_channel(r['panel_channel_id'])
+            lines.append(f"**{r['panel_name']}** — {ch.mention if ch else '`channel deleted`'}")
+        embed = discord.Embed(title="Ticket Panels", description="\n".join(lines), color=EMBED_COLOR)
+        await ctx.send(embed=embed, ephemeral=True)
+
+    @ticket.group(name="category", description="Add or remove buttons/options from one of your ticket panels.")
     @commands.has_permissions(manage_guild=True)
     async def category(self, ctx):
         if ctx.invoked_subcommand is None: await ctx.send_help(ctx.command)
 
-    @category.command(name="add", description="Add a new category/button to the ticket panel.")
+    async def panel_autocomplete(self, interaction: discord.Interaction, current: str):
+        panels = await self.db.fetchall("SELECT panel_name FROM ticket_panels WHERE guild_id=?", (interaction.guild.id,))
+        return [app_commands.Choice(name=p['panel_name'], value=p['panel_name']) for p in panels if current.lower() in p['panel_name'].lower()][:25]
+
+    @category.command(name="add", description="Add a new category/button to one of your ticket panels.")
     @commands.has_permissions(manage_guild=True)
     @app_commands.describe(
+        panel="Which panel to add this category to.",
         name="Name shown on the button/option (e.g. Support, Sales).",
         emoji="Emoji to show on the button/option (optional).",
         roles="Mention the staff role(s) to ping/give access, separated by spaces (optional).",
@@ -573,19 +701,21 @@ class TicketCog(commands.Cog, name="Ticket System"):
         app_commands.Choice(name="Green", value=discord.ButtonStyle.success.value),
         app_commands.Choice(name="Red", value=discord.ButtonStyle.danger.value),
     ])
-    async def category_add(self, ctx, name: str, emoji: str = None, roles: str = None, style: app_commands.Choice[int] = None, category: discord.CategoryChannel = None):
+    @app_commands.autocomplete(panel=panel_autocomplete)
+    async def category_add(self, ctx, panel: str, name: str, emoji: str = None, roles: str = None, style: app_commands.Choice[int] = None, category: discord.CategoryChannel = None):
         await ctx.defer(ephemeral=True)
         guild = ctx.guild
-        config = await self.db.fetchone("SELECT * FROM guild_configs WHERE guild_id=?", (guild.id,))
-        if not config or not config['panel_message_id']:
-            return await ctx.send(f"{ERROR_EMOJI} Run `/ticket setup` first to create your panel, then you can add more categories any time.", ephemeral=True)
+        panel_row = await self.resolve_panel(guild.id, panel)
+        if not panel_row or not panel_row['panel_message_id']:
+            return await ctx.send(f"{ERROR_EMOJI} Couldn't find a fully set-up panel named `{panel}`. Run `/ticket setup` first or check `/ticket panels`.", ephemeral=True)
+        panel_id = panel_row['panel_id']
 
-        current_count = (await self.db.fetchone("SELECT COUNT(*) as n FROM ticket_categories WHERE guild_id=?", (guild.id,)))['n']
+        current_count = (await self.db.fetchone("SELECT COUNT(*) as n FROM ticket_categories WHERE panel_id=?", (panel_id,)))['n']
         if current_count >= MAX_CATEGORIES:
-            return await ctx.send(f"{ERROR_EMOJI} Max of {MAX_CATEGORIES} categories reached.", ephemeral=True)
+            return await ctx.send(f"{ERROR_EMOJI} Max of {MAX_CATEGORIES} categories reached for this panel.", ephemeral=True)
 
-        if await self.db.fetchone("SELECT 1 FROM ticket_categories WHERE guild_id=? AND name=?", (guild.id, name)):
-            return await ctx.send(f"{ERROR_EMOJI} A category named `{name}` already exists.", ephemeral=True)
+        if await self.db.fetchone("SELECT 1 FROM ticket_categories WHERE panel_id=? AND name=?", (panel_id, name)):
+            return await ctx.send(f"{ERROR_EMOJI} A category named `{name}` already exists on panel `{panel}`.", ephemeral=True)
 
         role_ids = re.findall(r'<@&(\d+)>', roles) if roles else []
 
@@ -599,23 +729,29 @@ class TicketCog(commands.Cog, name="Ticket System"):
 
         button_style = style.value if style else discord.ButtonStyle.secondary.value
         await self.db.execute(
-            "INSERT INTO ticket_categories (guild_id, name, emoji, notified_roles, button_style, discord_category_id) VALUES (?,?,?,?,?,?)",
-            (guild.id, name, emoji, ",".join(role_ids) if role_ids else None, button_style, cat_ch.id)
+            "INSERT INTO ticket_categories (guild_id, panel_id, name, emoji, notified_roles, button_style, discord_category_id) VALUES (?,?,?,?,?,?,?)",
+            (guild.id, panel_id, name, emoji, ",".join(role_ids) if role_ids else None, button_style, cat_ch.id)
         )
 
-        if await self.refresh_panel(guild) is None:
-            return await ctx.send(f"{SUCCESS_EMOJI} Category `{name}` created, but I couldn't find the panel message to update it live — try re-running `/ticket setup` if the panel is missing.", ephemeral=True)
-        await ctx.send(f"{SUCCESS_EMOJI} Category `{name}` added (using Discord category **{cat_ch.name}**) — the panel has been updated.", ephemeral=True)
+        if await self.refresh_panel(panel_id) is None:
+            return await ctx.send(f"{SUCCESS_EMOJI} Category `{name}` created on `{panel}`, but I couldn't find the panel message to update it live.", ephemeral=True)
+        await ctx.send(f"{SUCCESS_EMOJI} Category `{name}` added to panel `{panel}` (using Discord category **{cat_ch.name}**) — the panel has been updated.", ephemeral=True)
 
-    @category.command(name="remove", description="Remove a category/button from the ticket panel.")
+    @category.command(name="remove", description="Remove a category/button from one of your ticket panels.")
     @commands.has_permissions(manage_guild=True)
-    @app_commands.describe(name="Name of the category to remove.")
-    async def category_remove(self, ctx, name: str):
+    @app_commands.describe(panel="Which panel to remove the category from.", name="Name of the category to remove.")
+    @app_commands.autocomplete(panel=panel_autocomplete)
+    async def category_remove(self, ctx, panel: str, name: str):
         await ctx.defer(ephemeral=True)
         guild = ctx.guild
-        cat = await self.db.fetchone("SELECT * FROM ticket_categories WHERE guild_id=? AND name=?", (guild.id, name))
+        panel_row = await self.resolve_panel(guild.id, panel)
+        if not panel_row:
+            return await ctx.send(f"{ERROR_EMOJI} No panel named `{panel}` found.", ephemeral=True)
+        panel_id = panel_row['panel_id']
+
+        cat = await self.db.fetchone("SELECT * FROM ticket_categories WHERE panel_id=? AND name=?", (panel_id, name))
         if not cat:
-            return await ctx.send(f"{ERROR_EMOJI} No category named `{name}` found.", ephemeral=True)
+            return await ctx.send(f"{ERROR_EMOJI} No category named `{name}` found on panel `{panel}`.", ephemeral=True)
 
         await self.db.execute("DELETE FROM ticket_categories WHERE category_id=?", (cat['category_id'],))
 
@@ -627,32 +763,40 @@ class TicketCog(commands.Cog, name="Ticket System"):
             try: await disc_cat.delete()
             except Exception: pass
 
-        await self.refresh_panel(guild)
-        await ctx.send(f"{SUCCESS_EMOJI} Category `{name}` removed — the panel has been updated.", ephemeral=True)
+        await self.refresh_panel(panel_id)
+        await ctx.send(f"{SUCCESS_EMOJI} Category `{name}` removed from panel `{panel}` — the panel has been updated.", ephemeral=True)
 
     @category_remove.autocomplete('name')
     async def category_remove_autocomplete(self, interaction: discord.Interaction, current: str):
-        cats = await self.db.fetchall("SELECT name FROM ticket_categories WHERE guild_id=?", (interaction.guild.id,))
+        panel_name = getattr(interaction.namespace, 'panel', None)
+        if not panel_name:
+            return []
+        panel_row = await self.resolve_panel(interaction.guild.id, panel_name)
+        if not panel_row:
+            return []
+        cats = await self.db.fetchall("SELECT name FROM ticket_categories WHERE panel_id=?", (panel_row['panel_id'],))
         return [app_commands.Choice(name=c['name'], value=c['name']) for c in cats if current.lower() in c['name'].lower()][:25]
 
-    @ticket.command(name="color", description="Change the ticket panel embed color.")
+    @ticket.command(name="color", description="Change one ticket panel's embed color.")
     @commands.has_permissions(manage_guild=True)
-    @app_commands.describe(hex_color="Hex color code, e.g. #FF0000")
-    async def color(self, ctx, hex_color: str):
+    @app_commands.describe(panel="Which panel to re-color.", hex_color="Hex color code, e.g. #FF0000")
+    @app_commands.autocomplete(panel=panel_autocomplete)
+    async def color(self, ctx, panel: str, hex_color: str):
         await ctx.defer(ephemeral=True)
         hex_clean = hex_color.strip().lstrip('#')
         if not re.fullmatch(r'[0-9a-fA-F]{6}', hex_clean):
             return await ctx.send(f"{ERROR_EMOJI} Invalid hex color. Use a format like `FF0000` or `#FF0000`.", ephemeral=True)
 
-        color_int = int(hex_clean, 16)
-        await self.db.execute(
-            "INSERT INTO guild_configs (guild_id, embed_color) VALUES (?,?) ON CONFLICT(guild_id) DO UPDATE SET embed_color=excluded.embed_color",
-            (ctx.guild.id, color_int)
-        )
+        panel_row = await self.resolve_panel(ctx.guild.id, panel)
+        if not panel_row:
+            return await ctx.send(f"{ERROR_EMOJI} No panel named `{panel}` found.", ephemeral=True)
 
-        if await self.refresh_panel(ctx.guild) is None:
-            return await ctx.send(f"{SUCCESS_EMOJI} Color saved, but I couldn't find a live panel message to update — it'll apply next time you run `/ticket setup`.", ephemeral=True)
-        await ctx.send(f"{SUCCESS_EMOJI} Panel embed color updated to `#{hex_clean.upper()}`.", ephemeral=True)
+        color_int = int(hex_clean, 16)
+        await self.db.execute("UPDATE ticket_panels SET embed_color=? WHERE panel_id=?", (color_int, panel_row['panel_id']))
+
+        if await self.refresh_panel(panel_row['panel_id']) is None:
+            return await ctx.send(f"{SUCCESS_EMOJI} Color saved for `{panel}`, but I couldn't find a live panel message to update.", ephemeral=True)
+        await ctx.send(f"{SUCCESS_EMOJI} Panel `{panel}` embed color updated to `#{hex_clean.upper()}`.", ephemeral=True)
 
     # --- Text/slash command versions of the action buttons ---
     async def _dispatch_action(self, ctx: Context, action: str):
