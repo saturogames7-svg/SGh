@@ -2,11 +2,11 @@ import discord
 from utils.emoji import ICONS_CHANNEL, ICONS_PLUS, TICK, ZTICK
 from discord.ext import commands
 from discord.ui import View, Select, Button
-import aiosqlite
 import asyncio
 import re
 import json
 from utils.Tools import *
+from utils.welcome_db import welcome_db
 
 class VariableButton(Button):
     def __init__(self, author):
@@ -48,50 +48,14 @@ class VariableButton(Button):
 class Welcomer(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.bot.loop.create_task(self._create_table())
 
-    # --- Schema definition: single source of truth for expected columns/types. ---
-    # Whenever a new column needs to be added in a future update, add it HERE
-    # (and nowhere else) - the migration below will take care of adding it to
-    # any database file that was created before this update.
-    SCHEMA = {
-        "guild_id": "INTEGER PRIMARY KEY",
-        "welcome_type": "TEXT",
-        "welcome_message": "TEXT",
-        "channel_id": "INTEGER",
-        "embed_data": "TEXT",
-        "auto_delete_duration": "INTEGER",
-    }
-
-    async def _create_table(self):
-        async with aiosqlite.connect("db/welcome.db") as db:
-            columns_sql = ", ".join(f"{name} {ctype}" for name, ctype in self.SCHEMA.items())
-            await db.execute(f"CREATE TABLE IF NOT EXISTS welcome ({columns_sql})")
-            await db.commit()
-            await self._migrate_table(db)
-
-    async def _migrate_table(self, db):
-        """
-        Ensures an existing (pre-update) welcome.db has every column defined in
-        SCHEMA. CREATE TABLE IF NOT EXISTS does nothing if the table already
-        exists, so if a new column gets added to SCHEMA in a future update,
-        old guild rows created before that update would be missing it and
-        every query touching that column (or unpacking the full row) would
-        break. This checks the real columns via PRAGMA and ALTERs in any
-        that are missing, so old data keeps working after an update.
-        """
-        async with db.execute("PRAGMA table_info(welcome)") as cursor:
-            existing_columns = {row[1] for row in await cursor.fetchall()}
-
-        missing_columns = [name for name in self.SCHEMA if name not in existing_columns]
-        for name in missing_columns:
-            # PRIMARY KEY columns can't be added via ALTER TABLE, but guild_id
-            # will always exist already since it's part of the original CREATE.
-            col_type = self.SCHEMA[name].replace("PRIMARY KEY", "").strip()
-            await db.execute(f"ALTER TABLE welcome ADD COLUMN {name} {col_type}")
-
-        if missing_columns:
-            await db.commit()
+    async def cog_load(self):
+        # Table creation moved here from __init__ (was fire-and-forget via
+        # bot.loop.create_task with a local aiosqlite file before). This is
+        # now properly awaited by discord.py during cog load, and is
+        # idempotent so it's safe even though greet2.py's cog_load also
+        # calls it.
+        await welcome_db.initialize()
 
     @commands.hybrid_group(invoke_without_command=True, name="greet", help="Shows all the greet commands.")
     @blacklist_check()
@@ -108,11 +72,9 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_setup(self, ctx):
-        async with aiosqlite.connect("db/welcome.db") as db:
-            async with db.execute("SELECT * FROM welcome WHERE guild_id = ?", (ctx.guild.id,)) as cursor:
-                row = await cursor.fetchone()
-        
-        if row:
+        already_exists = await welcome_db.exists(ctx.guild.id)
+
+        if already_exists:
             error = discord.Embed(description=f"A welcome message has already been set in {ctx.guild.name}. Use `{ctx.prefix}greet reset` to reconfigure.", color=0xFF0000)
             error.set_author(name="Error", icon_url="https://cdn.discordapp.com/emojis/1294218790082711553.png")
             return await ctx.send(embed=error)
@@ -212,7 +174,7 @@ class Welcomer(commands.Cog):
                 await interaction.response.send_message("You cannot interact with this setup.", ephemeral=True)
                 return
             if message_content:
-                await self._save_welcome_data(ctx.guild.id, "simple", message_content[0])
+                await welcome_db.save_welcome_data(ctx.guild.id, "simple", message_content[0])
                 await interaction.response.send_message(f"{TICK}> Welcome message setup completed!")
                 for item in setup_view.children:
                     item.disabled = True
@@ -259,30 +221,6 @@ class Welcomer(commands.Cog):
             await update_preview(msg.content)
         except asyncio.TimeoutError:
             await ctx.send("Setup timed out.")
-
-    
-    async def _save_welcome_data(self, guild_id, welcome_type, message, embed_data=None):
-        # NOTE: uses UPDATE-if-exists / INSERT-if-not, instead of INSERT OR
-        # REPLACE, so that columns not passed in here (like channel_id or
-        # auto_delete_duration) aren't wiped out if a row already exists.
-        async with aiosqlite.connect("db/welcome.db") as db:
-            async with db.execute("SELECT 1 FROM welcome WHERE guild_id = ?", (guild_id,)) as cursor:
-                exists = await cursor.fetchone()
-
-            if exists:
-                await db.execute(
-                    "UPDATE welcome SET welcome_type = ?, welcome_message = ?, embed_data = ? WHERE guild_id = ?",
-                    (welcome_type, message, json.dumps(embed_data) if embed_data else None, guild_id)
-                )
-            else:
-                await db.execute(
-                    "INSERT INTO welcome (guild_id, welcome_type, welcome_message, embed_data) VALUES (?, ?, ?, ?)",
-                    (guild_id, welcome_type, message, json.dumps(embed_data) if embed_data else None)
-                )
-            await db.commit()
-
-    
-
 
     async def embed_setup(self, ctx):
         setup_view = View(timeout=600)
@@ -424,7 +362,7 @@ class Welcomer(commands.Cog):
                 await interaction.response.send_message("Please provide at least a title or an description before submitting.", ephemeral=True)
                 return
 
-            await self._save_welcome_data(ctx.guild.id, "embed", embed_data["message"] or "", embed_data)
+            await welcome_db.save_welcome_data(ctx.guild.id, "embed", embed_data["message"] or "", embed_data)
             await interaction.response.send_message(f"{TICK}> Embed welcome message setup completed!")
 
             for item in setup_view.children:
@@ -449,8 +387,6 @@ class Welcomer(commands.Cog):
 
         await update_preview()
 
-    
-
     @greet.command(name="reset", aliases=["disable"], help="Resets and deletes the current welcome configuration for the server.")
     @blacklist_check()
     @ignore_check()
@@ -458,9 +394,7 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_reset(self, ctx):
-        async with aiosqlite.connect("db/welcome.db") as db:
-            cursor = await db.execute("SELECT 1 FROM welcome WHERE guild_id = ?", (ctx.guild.id,))
-            is_set_up = await cursor.fetchone()
+        is_set_up = await welcome_db.exists(ctx.guild.id)
 
         if not is_set_up: 
             error = discord.Embed(description=f"No welcome message has been set for {ctx.guild.name}! Please set a welcome message first using `{ctx.prefix}greet setup`", color=0xFF0000)
@@ -481,9 +415,7 @@ class Welcomer(commands.Cog):
                 await interaction.response.send_message("Only the command author can confirm this action.", ephemeral=True)
                 return
 
-            async with aiosqlite.connect("db/welcome.db") as db:
-                await db.execute("DELETE FROM welcome WHERE guild_id = ?", (ctx.guild.id,))
-                await db.commit()
+            await welcome_db.delete_guild(ctx.guild.id)
 
             embed.color = discord.Color(0xFF0000)
             embed.title = f"{TICK}> Success"
@@ -517,11 +449,9 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_channel(self, ctx):
-        async with aiosqlite.connect("db/welcome.db") as db:
-            async with db.execute("SELECT welcome_type, channel_id FROM welcome WHERE guild_id = ?", (ctx.guild.id,)) as cursor:
-                result = await cursor.fetchone()
-                welcome_message = result[0] if result else None
-                welcome_channel = ctx.guild.get_channel(result[1]) if result and result[1] else None
+        result = await welcome_db.get_columns(["welcome_type", "channel_id"], ctx.guild.id)
+        welcome_message = result[0] if result else None
+        welcome_channel = ctx.guild.get_channel(result[1]) if result and result[1] else None
 
         if not welcome_message:
             error = discord.Embed(description=f"No welcome message has been set for {ctx.guild.name}! Please set a welcome message first using `{ctx.prefix}greet setup`", color=0xFF0000)
@@ -551,9 +481,7 @@ class Welcomer(commands.Cog):
                 selected_channel_id = int(select_menu.values[0])
                 selected_channel = ctx.guild.get_channel(selected_channel_id)
 
-                async with aiosqlite.connect("db/welcome.db") as db:
-                    await db.execute("UPDATE welcome SET channel_id = ? WHERE guild_id = ?", (selected_channel_id, ctx.guild.id))
-                    await db.commit()
+                await welcome_db.update_channel(ctx.guild.id, selected_channel_id)
 
                 embed.description = f"Current Welcome Channel: {selected_channel.mention}"
                 await interaction.response.edit_message(embed=embed, view=None)
@@ -607,9 +535,7 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_test(self, ctx):
-        async with aiosqlite.connect("db/welcome.db") as db:
-            async with db.execute("SELECT welcome_type, welcome_message, channel_id, embed_data FROM welcome WHERE guild_id = ?", (ctx.guild.id,)) as cursor:
-                row = await cursor.fetchone()
+        row = await welcome_db.get_columns(["welcome_type", "welcome_message", "channel_id", "embed_data"], ctx.guild.id)
 
         if row is None:
             error = discord.Embed(description=f"No welcome message has been set for {ctx.guild.name}! Please set a welcome message first using `{ctx.prefix}greet setup`", color=0xFF0000)
@@ -707,9 +633,7 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_config(self, ctx):
-        async with aiosqlite.connect("db/welcome.db") as db:
-            async with db.execute("SELECT * FROM welcome WHERE guild_id = ?", (ctx.guild.id,)) as cursor:
-                row = await cursor.fetchone()
+        row = await welcome_db.get_row(ctx.guild.id)
 
         if row:
             _, welcome_type, welcome_message, channel_id, embed_data, auto_delete_duration = row
@@ -776,14 +700,7 @@ class Welcomer(commands.Cog):
             await ctx.send("Invalid time format. Please use 's' for seconds and 'm' for minutes.")
             return
 
-        
-        async with aiosqlite.connect("db/welcome.db") as db:
-            await db.execute("""
-            UPDATE welcome
-            SET auto_delete_duration = ?
-            WHERE guild_id = ?
-            """, (auto_delete_duration, ctx.guild.id))
-            await db.commit()
+        await welcome_db.update_auto_delete(ctx.guild.id, auto_delete_duration)
 
         await ctx.send(f"{ZTICK} Auto delete duration has been set to **{auto_delete_duration}** seconds.")
 
@@ -796,9 +713,7 @@ class Welcomer(commands.Cog):
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
     async def greet_edit(self, ctx):
-        async with aiosqlite.connect("db/welcome.db") as db:
-            async with db.execute("SELECT welcome_type, welcome_message, embed_data FROM welcome WHERE guild_id = ?", (ctx.guild.id,)) as cursor:
-                row = await cursor.fetchone()
+        row = await welcome_db.get_columns(["welcome_type", "welcome_message", "embed_data"], ctx.guild.id)
 
         if row is None:
             error = discord.Embed(description=f"No welcome message has been set for {ctx.guild.name}! Please set a welcome message first using `{ctx.prefix}greet setup`", color=0xFF0000)
@@ -847,9 +762,8 @@ class Welcomer(commands.Cog):
                         await ctx.send("Setup was canceled. No changes were made.")
                         return
                     await new_message.delete()
-                    async with aiosqlite.connect("db/welcome.db") as db:
-                        await db.execute("UPDATE welcome SET welcome_message = ? WHERE guild_id = ?", (new_message.content, ctx.guild.id))
-                        await db.commit()
+
+                    await welcome_db.update_welcome_message(ctx.guild.id, new_message.content)
 
                     embed.description = f"**Response Type:** Simple\n**Message Content:** {new_message.content}"
                     edit_button.disabled = True
@@ -951,9 +865,7 @@ class Welcomer(commands.Cog):
                             else:
                                 embed_data_json[selected_option] = url_or_text
 
-                        async with aiosqlite.connect("db/welcome.db") as db:
-                            await db.execute("UPDATE welcome SET embed_data = ? WHERE guild_id = ?", (json.dumps(embed_data_json), ctx.guild.id))
-                            await db.commit()
+                        await welcome_db.update_embed_data(ctx.guild.id, embed_data_json)
 
                         embed.description = f"**Response Type:** Embed\n**Embed Data:**\n```{json.dumps(embed_data_json, indent=4)}```"
                         await interaction.message.edit(embed=embed, view=None)
@@ -973,3 +885,4 @@ class Welcomer(commands.Cog):
             view.add_item(cancel_button)
             
             await ctx.send(embed=embed, view=view)
+            
