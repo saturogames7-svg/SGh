@@ -10,7 +10,7 @@ AI_NSFW_CONTENT_FILTER: true
 LANGUAGE: en 
 DEFAULT_INSTRUCTION: soniye 
 
-Discord: https://discord.gg/codexdev
+Discord: https://discord.gg/G2USDHCK7t
 
 TRIGGER:
   - chatbot
@@ -23,7 +23,7 @@ DISABLE_PRESENCE: false
 PRESENCES:
   - How can I assist you?
   - Currently in {guild_count} guilds
-  - Support at https://discord.gg/codexdev
+  - Support at https://discord.gg/G2USDHCK7t
 
 
 BLACKLIST_WORDS: #changed to cogs/imagine.py
