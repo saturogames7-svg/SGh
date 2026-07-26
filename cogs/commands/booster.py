@@ -418,9 +418,12 @@ class Booster (Cog ):
     # Automatic boost detection
     # ------------------------------------------------------------------
 
-    @commands .Cog .listener ()
+    @Cog .listener ()
     async def on_member_update (self ,before :discord .Member ,after :discord .Member ):
         """Detect new boosts, removed boosts, and re-boosts and act on them automatically"""
+        if before .premium_since !=after .premium_since :
+            logging .info (f"[Boost] premium_since changed for {after} ({after.id}) in {after.guild.name}: {before.premium_since} -> {after.premium_since}")
+
         if before .premium_since ==after .premium_since :
             return 
 
