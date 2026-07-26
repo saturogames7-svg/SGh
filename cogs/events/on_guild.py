@@ -1,17 +1,3 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                                                                  ║
-# ║   ░█▀▀░█▀█░█▀▄░█▀▀░█░█   ░█▀▄░█▀▀░█░█░█▀▀                     ║
-# ║   ░█░░░█░█░█░█░█▀▀░▄▀▄   ░█░█░█▀▀░▀▄▀░▀▀█                     ║
-# ║   ░▀▀▀░▀▀▀░▀▀░░▀▀▀░▀░▀   ░▀▀░░▀▀▀░░▀░░▀▀▀                     ║
-# ║                                                                  ║
-# ║            © 2026 CodeX Devs — All Rights Reserved              ║
-# ║                                                                  ║
-# ║   discord  ──  https://discord.gg/codexdev                      ║
-# ║   youtube  ──  https://youtube.com/@CodeXDevs                   ║
-# ║   github   ──  https://github.com/RayExo                        ║
-# ║                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
 from discord.ext import commands
 from core import zyrox, Cog
 import discord
@@ -100,7 +86,7 @@ Threads : {len(guild.threads)}
                 await guild.chunk()
 
             embed = discord.Embed(
-                description=f"{ARROWRED} Prefix For This Server is `>`\n{ARROWRED} Get Started with `>help`\n{ARROWRED} For detailed guides, FAQ & information, visit our **[Support Server](https://discord.gg/codexdev)**",
+                description=f"{ARROWRED} Prefix For This Server is `>`\n{ARROWRED} Get Started with `>help`\n{ARROWRED} For detailed guides, FAQ & information, visit our **[Support Server](https://discord.gg/G2USDHCK7t)**",
                 color=0xFF0000,
             )
             embed.set_author(
