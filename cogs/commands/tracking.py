@@ -334,6 +334,19 @@ class InviteDatabase:
             (amount, guild_id, user_id),
         )
 
+    async def decrement_left(self, guild_id: int, user_id: int, amount: int = 1) -> None:
+        """Undo a previous 'left' credit (called when a departed invitee
+        rejoins), clamped so the counter never goes negative. Without this,
+        'left' keeps growing on every leave while 'total' never grows again
+        on rejoin, so real = total - fake - left eventually gets stuck at 0
+        forever for any inviter whose invitees leave and rejoin a few times.
+        """
+        await self.ensure_stats_row(guild_id, user_id)
+        await self.execute(
+            "UPDATE invite_stats SET left = MAX(left - ?, 0) WHERE guild_id=? AND user_id=?",
+            (amount, guild_id, user_id),
+        )
+
     async def set_stats(
         self,
         guild_id: int,
@@ -922,6 +935,9 @@ class Tracking(commands.Cog, name="Invite Tracker"):
             try:
                 if is_rejoin:
                     await self.db.increment(guild.id, inviter.id, "rejoin", 1)
+                    # They're back - undo the earlier "left" credit so real
+                    # invites don't stay permanently suppressed.
+                    await self.db.decrement_left(guild.id, inviter.id, 1)
                 elif is_suspected_fake:
                     await self.db.increment(guild.id, inviter.id, "total", 1)
                     await self.db.increment(guild.id, inviter.id, "fake", 1)
