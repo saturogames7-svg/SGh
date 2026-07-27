@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import os
 import re
-from utils.turso_db import get_client
+from utils.turso_db import get_client, execute as turso_execute
 
 
 logging.basicConfig(level=logging.INFO)
@@ -986,6 +986,10 @@ class ChannelSelectView(View):
                         )
                         return
 
+                    # Acknowledge immediately - the Turso save below can take
+                    # longer than Discord's 3-second interaction window.
+                    await interaction.response.defer()
+
                     channel_id = (
                         None if select.values[0] == "skip" else int(select.values[0])
                     )
@@ -1027,7 +1031,7 @@ class ChannelSelectView(View):
                         f"{self.category.replace('_', ' ').title()} logs will be sent to: {channel_text}",
                         f"Guild ID: {interaction.guild.id}",
                     )
-                    await interaction.response.edit_message(view=layout_view)
+                    await interaction.edit_original_response(view=layout_view)
                 else:
                     if select.values[0] == "skip":
                         self.parent_view.selected_channels[self.category] = None
@@ -1039,7 +1043,19 @@ class ChannelSelectView(View):
                     await self.return_to_setup(interaction)
         except Exception as e:
             logger.error(f"Error in channel selection callback: {e}")
-            pass
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        "Something went wrong saving that selection. Please try again.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "Something went wrong saving that selection. Please try again.",
+                        ephemeral=True,
+                    )
+            except Exception:
+                pass
 
     @discord.ui.button(label="Back to Setup", style=discord.ButtonStyle.secondary)
     async def back_button(self, interaction: discord.Interaction, button: Button):
@@ -1165,15 +1181,14 @@ class Logging(commands.Cog):
     async def _load_config(self):
         """Load configuration from Turso with error handling."""
         try:
-            client = get_client()
-            await client.execute(
+            await turso_execute(
                 "CREATE TABLE IF NOT EXISTS logging_config ("
                 "guild_id TEXT PRIMARY KEY, "
                 "config_json TEXT NOT NULL"
                 ")"
             )
 
-            rs = await client.execute(
+            rs = await turso_execute(
                 "SELECT guild_id, config_json FROM logging_config"
             )
             for row in rs.rows:
@@ -1199,10 +1214,9 @@ class Logging(commands.Cog):
                 if config is None:
                     return
 
-                client = get_client()
                 content = await asyncio.to_thread(json.dumps, config, default=str)
 
-                await client.execute(
+                await turso_execute(
                     """
                     INSERT INTO logging_config (guild_id, config_json)
                     VALUES (?, ?)
@@ -1217,8 +1231,7 @@ class Logging(commands.Cog):
     async def _delete_config(self, guild_id: int):
         """Delete a guild's configuration row from Turso."""
         try:
-            client = get_client()
-            await client.execute(
+            await turso_execute(
                 "DELETE FROM logging_config WHERE guild_id = ?", [str(guild_id)]
             )
         except Exception as e:
