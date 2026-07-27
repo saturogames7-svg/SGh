@@ -2,7 +2,7 @@ import discord
 from utils.emoji import CROSS, TICK
 from discord.ext import commands
 from discord.ui import LayoutView, TextDisplay, Separator, Container
-from utils.turso_db import get_client
+from utils.turso_db import execute as turso_execute
 from utils.Tools import *
 from utils.cv2 import CV2, build_container
 
@@ -13,8 +13,7 @@ class AutoResponder(commands.Cog):
         self.bot.loop.create_task(self.initialize_db())
 
     async def initialize_db(self):
-        client = get_client()
-        await client.execute('''
+        await turso_execute('''
             CREATE TABLE IF NOT EXISTS autoresponses (
                 guild_id TEXT,
                 name TEXT,
@@ -39,9 +38,8 @@ class AutoResponder(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def _create(self, ctx, name, *, message):
         name_lower = name.lower()
-        client = get_client()
 
-        rs = await client.execute(
+        rs = await turso_execute(
             "SELECT COUNT(*) FROM autoresponses WHERE guild_id = ?",
             [str(ctx.guild.id)],
         )
@@ -50,7 +48,7 @@ class AutoResponder(commands.Cog):
             view = CV2(f"{CROSS} Error!", f"You can't add more than 20 autoresponses in {ctx.guild.name}")
             return await ctx.reply(view=view)
 
-        rs = await client.execute(
+        rs = await turso_execute(
             "SELECT 1 FROM autoresponses WHERE guild_id = ? AND LOWER(name) = ?",
             [str(ctx.guild.id), name_lower],
         )
@@ -58,7 +56,7 @@ class AutoResponder(commands.Cog):
             view = CV2(f"{CROSS} Error!", f"The autoresponse with the name `{name}` already exists in {ctx.guild.name}")
             return await ctx.reply(view=view)
 
-        await client.execute(
+        await turso_execute(
             "INSERT INTO autoresponses (guild_id, name, message) VALUES (?, ?, ?)",
             [str(ctx.guild.id), name_lower, message],
         )
@@ -72,9 +70,8 @@ class AutoResponder(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def _delete(self, ctx, name):
         name_lower = name.lower()
-        client = get_client()
 
-        rs = await client.execute(
+        rs = await turso_execute(
             "SELECT 1 FROM autoresponses WHERE guild_id = ? AND LOWER(name) = ?",
             [str(ctx.guild.id), name_lower],
         )
@@ -82,7 +79,7 @@ class AutoResponder(commands.Cog):
             view = CV2(f"{CROSS} Error!", f"No autoresponder found with the name `{name}` in {ctx.guild.name}")
             return await ctx.reply(view=view)
 
-        await client.execute(
+        await turso_execute(
             "DELETE FROM autoresponses WHERE guild_id = ? AND LOWER(name) = ?",
             [str(ctx.guild.id), name_lower],
         )
@@ -96,9 +93,8 @@ class AutoResponder(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def _edit(self, ctx, name, *, message):
         name_lower = name.lower()
-        client = get_client()
 
-        rs = await client.execute(
+        rs = await turso_execute(
             "SELECT 1 FROM autoresponses WHERE guild_id = ? AND LOWER(name) = ?",
             [str(ctx.guild.id), name_lower],
         )
@@ -106,7 +102,7 @@ class AutoResponder(commands.Cog):
             view = CV2(f"{CROSS} Error!", f"No autoresponder found with the name `{name}` in {ctx.guild.name}")
             return await ctx.reply(view=view)
 
-        await client.execute(
+        await turso_execute(
             "UPDATE autoresponses SET message = ? WHERE guild_id = ? AND LOWER(name) = ?",
             [message, str(ctx.guild.id), name_lower],
         )
@@ -119,8 +115,7 @@ class AutoResponder(commands.Cog):
     @commands.cooldown(1, 5, commands.BucketType.user)
     @commands.has_permissions(administrator=True)
     async def _config(self, ctx):
-        client = get_client()
-        rs = await client.execute(
+        rs = await turso_execute(
             "SELECT name FROM autoresponses WHERE guild_id = ?",
             [str(ctx.guild.id)],
         )
@@ -139,8 +134,7 @@ class AutoResponder(commands.Cog):
         if message.author == self.bot.user:
             return
 
-        client = get_client()
-        rs = await client.execute(
+        rs = await turso_execute(
             "SELECT message FROM autoresponses WHERE guild_id = ? AND LOWER(name) = ?",
             [str(message.guild.id), message.content.lower()],
         )
