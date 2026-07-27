@@ -365,20 +365,4 @@ class General(commands.Cog):
     else:
       hash_lines = f"**{algorithm}:** `{algos[algorithm.lower()]}`"
     await ctx.reply(view=CV2(f"Hashed \"{message}\"", hash_lines), mention_author=True)
-
-  @commands.command(
-      name="invite",
-      aliases=['invite-bot'],
-      description="Get Support & Bot invite link!"
-  )
-  @blacklist_check()
-  @ignore_check()
-  @commands.cooldown(1, 3, commands.BucketType.user)
-  async def invite(self, ctx: commands.Context):
-      invite_text = (
-          "```Empower your server with blazing-fast features and 24/7 support!```\n"
-          f"{ZYROXLINKS} **Quick Actions**\n"
-          f">>> **[Invite {BotName}](https://discord.com/oauth2/authorize?client_id=1396547865224155296&permissions=0&integration_type=0&scope=bot+applications.commands)**\n"
-          "**[Support Server](https://discord.gg/G2USDHCK7t)**"
-      )
-      await ctx.send(view=CV2(f"{ZYROXCONNECTION} {BotName} Integration Hub!", invite_text))
+    
