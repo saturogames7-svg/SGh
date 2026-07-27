@@ -1,3 +1,17 @@
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                                                                  ║
+# ║   ░█▀▀░█▀█░█▀▄░█▀▀░█░█   ░█▀▄░█▀▀░█░█░█▀▀                     ║
+# ║   ░█░░░█░█░█░█░█▀▀░▄▀▄   ░█░█░█▀▀░▀▄▀░▀▀█                     ║
+# ║   ░▀▀▀░▀▀▀░▀▀░░▀▀▀░▀░▀   ░▀▀░░▀▀▀░░▀░░▀▀▀                     ║
+# ║                                                                  ║
+# ║            © 2026 CodeX Devs — All Rights Reserved              ║
+# ║                                                                  ║
+# ║   discord  ──  https://discord.gg/codexdev                      ║
+# ║   youtube  ──  https://youtube.com/@CodeXDevs                   ║
+# ║   github   ──  https://github.com/RayExo                        ║
+# ║                                                                  ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
 import discord
 from discord.ext import commands
 from discord.ui import View, Select, Button
@@ -990,17 +1004,27 @@ class ChannelSelectView(View):
                         None if select.values[0] == "skip" else int(select.values[0])
                     )
 
-                    log_channels = {self.category: channel_id}
-                    log_enabled = {cat: bool(channel_id) for cat in LOG_CATEGORIES}
+                    # Merge with any existing configuration instead of wiping it,
+                    # so running /log setup again for another category doesn't
+                    # erase channels already configured for other categories.
+                    existing_config = await cog._get_log_config(interaction.guild.id) or {}
+                    log_channels = dict(existing_config.get("log_channels", {}))
+                    log_enabled = dict(existing_config.get("log_enabled", {}))
+
+                    if channel_id:
+                        log_channels[self.category] = channel_id
+                    elif self.category in log_channels:
+                        del log_channels[self.category]
+                    log_enabled[self.category] = bool(channel_id)
 
                     await cog._save_log_config(
                         interaction.guild.id,
                         log_channels,
                         log_enabled,
-                        [],
-                        [],
-                        [],
-                        None,
+                        existing_config.get("ignore_channels", []),
+                        existing_config.get("ignore_roles", []),
+                        existing_config.get("ignore_users", []),
+                        existing_config.get("auto_delete_duration"),
                     )
 
                     channel = (
@@ -1601,21 +1625,47 @@ class Logging(commands.Cog):
     async def log_setup(self, ctx: commands.Context):
         """Enhanced interactive setup with improved user experience."""
         try:
-            config = await self._get_log_config(ctx.guild.id)
-            if config:
-                embed = self._create_modern_embed(
-                    "Configuration Exists",
-                    "Logging is already configured. Use /log config to modify or /log reset to start over.",
-                )
-                await ctx.send(view=embed, ephemeral=True)
-                return
-
             view = LogSetupLayoutView(self.bot, ctx.author, LOG_CATEGORIES)
             message = await ctx.send(view=view)
         except Exception as e:
             logger.error(f"Error in log setup: {e}")
             embed = self._create_modern_embed(
                 "Setup Error", "An error occurred during setup. Please try again."
+            )
+            await ctx.send(view=embed)
+
+    @log.command(
+        name="setall",
+        description="Set all logging categories to the same channel and enable them.",
+    )
+    @commands.has_permissions(manage_guild=True)
+    async def log_setall(self, ctx: commands.Context, channel: discord.TextChannel):
+        """Quickly configure every logging category to point at one channel."""
+        try:
+            existing_config = await self._get_log_config(ctx.guild.id) or {}
+
+            log_channels = {cat: channel.id for cat in LOG_CATEGORIES}
+            log_enabled = {cat: True for cat in LOG_CATEGORIES}
+
+            await self._save_log_config(
+                ctx.guild.id,
+                log_channels,
+                log_enabled,
+                existing_config.get("ignore_channels", []),
+                existing_config.get("ignore_roles", []),
+                existing_config.get("ignore_users", []),
+                existing_config.get("auto_delete_duration"),
+            )
+
+            embed = self._create_modern_embed(
+                "All Categories Configured",
+                f"All {len(LOG_CATEGORIES)} logging categories are now enabled and pointed at {channel.mention}.",
+            )
+            await ctx.send(view=embed)
+        except Exception as e:
+            logger.error(f"Error in log setall: {e}")
+            embed = self._create_modern_embed(
+                "Setup Error", "An error occurred while configuring all categories."
             )
             await ctx.send(view=embed)
 
