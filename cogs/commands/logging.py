@@ -1,17 +1,3 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                                                                  ║
-# ║   ░█▀▀░█▀█░█▀▄░█▀▀░█░█   ░█▀▄░█▀▀░█░█░█▀▀                     ║
-# ║   ░█░░░█░█░█░█░█▀▀░▄▀▄   ░█░█░█▀▀░▀▄▀░▀▀█                     ║
-# ║   ░▀▀▀░▀▀▀░▀▀░░▀▀▀░▀░▀   ░▀▀░░▀▀▀░░▀░░▀▀▀                     ║
-# ║                                                                  ║
-# ║            © 2026 CodeX Devs — All Rights Reserved              ║
-# ║                                                                  ║
-# ║   discord  ──  https://discord.gg/codexdev                      ║
-# ║   youtube  ──  https://youtube.com/@CodeXDevs                   ║
-# ║   github   ──  https://github.com/RayExo                        ║
-# ║                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
 import discord
 from discord.ext import commands
 from discord.ui import View, Select, Button
@@ -25,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import os
 import re
+from utils.turso_db import get_client
 
 
 logging.basicConfig(level=logging.INFO)
@@ -43,7 +30,6 @@ LOG_CATEGORIES = [
     "system_events",
 ]
 
-CONFIG_FILE = "jsondb/logging_config.json"
 LOGS_DIR = "logs"
 MAX_AUDIT_CACHE_SIZE = 1000
 AUDIT_CACHE_TTL = 300
@@ -1167,64 +1153,66 @@ class Logging(commands.Cog):
                 logger.error(f"Error in cache cleanup: {e}")
 
     async def _load_config(self):
-        """Load configuration from JSON file with error handling."""
+        """Load configuration from Turso with error handling."""
         try:
-            if os.path.exists(CONFIG_FILE):
+            client = get_client()
+            await client.execute(
+                "CREATE TABLE IF NOT EXISTS logging_config ("
+                "guild_id TEXT PRIMARY KEY, "
+                "config_json TEXT NOT NULL"
+                ")"
+            )
+
+            rs = await client.execute(
+                "SELECT guild_id, config_json FROM logging_config"
+            )
+            for row in rs.rows:
+                guild_id_str = row["guild_id"]
                 try:
-                    async with aiofiles.open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                        content = await f.read()
-                        if content.strip():
-                            data = await asyncio.to_thread(json.loads, content)
-                            for guild_id_str, config in data.items():
-                                try:
-                                    guild_id = int(guild_id_str)
-
-                                    if isinstance(config, dict):
-                                        self.config_cache[guild_id] = config
-                                except (ValueError, TypeError) as e:
-                                    logger.warning(
-                                        f"Invalid guild ID or config in file: {guild_id_str}, {e}"
-                                    )
-                            pass
-                        else:
-                            pass
-                except json.JSONDecodeError as e:
-                    logger.error(f"Invalid JSON in config file: {e}")
-
-                    backup_file = f"{CONFIG_FILE}.backup.{int(time.time())}"
-                    await asyncio.to_thread(os.rename, CONFIG_FILE, backup_file)
-                    logger.info(f"Corrupted config backed up to {backup_file}")
-            else:
-                pass
+                    guild_id = int(guild_id_str)
+                    config = json.loads(row["config_json"])
+                    if isinstance(config, dict):
+                        self.config_cache[guild_id] = config
+                except (ValueError, TypeError, json.JSONDecodeError) as e:
+                    logger.warning(
+                        f"Invalid guild ID or config in DB row: {guild_id_str}, {e}"
+                    )
         except Exception as e:
-            logger.error(f"Error loading config: {e}")
+            logger.error(f"Error loading config from Turso: {e}")
             self.config_cache = {}
 
-    async def _save_config(self):
-        """Save configuration to JSON file with atomic writes and error handling."""
+    async def _save_config(self, guild_id: int):
+        """Persist a single guild's configuration to Turso (upsert)."""
         async with self.config_lock:
             try:
-                data = {
-                    str(guild_id): config
-                    for guild_id, config in self.config_cache.items()
-                }
-                content = await asyncio.to_thread(json.dumps, data, indent=2)
+                config = self.config_cache.get(guild_id)
+                if config is None:
+                    return
 
-                temp_file = f"{CONFIG_FILE}.tmp"
-                async with aiofiles.open(temp_file, "w", encoding="utf-8") as f:
-                    await f.write(content)
+                client = get_client()
+                content = await asyncio.to_thread(json.dumps, config, default=str)
 
-                await asyncio.to_thread(os.replace, temp_file, CONFIG_FILE)
-                pass
+                await client.execute(
+                    """
+                    INSERT INTO logging_config (guild_id, config_json)
+                    VALUES (?, ?)
+                    ON CONFLICT(guild_id) DO UPDATE SET config_json = excluded.config_json
+                    """,
+                    [str(guild_id), content],
+                )
             except Exception as e:
-                logger.error(f"Error saving config: {e}")
-
-                try:
-                    if os.path.exists(f"{CONFIG_FILE}.tmp"):
-                        await asyncio.to_thread(os.remove, f"{CONFIG_FILE}.tmp")
-                except:
-                    pass
+                logger.error(f"Error saving config for guild {guild_id} to Turso: {e}")
                 raise
+
+    async def _delete_config(self, guild_id: int):
+        """Delete a guild's configuration row from Turso."""
+        try:
+            client = get_client()
+            await client.execute(
+                "DELETE FROM logging_config WHERE guild_id = ?", [str(guild_id)]
+            )
+        except Exception as e:
+            logger.error(f"Error deleting config for guild {guild_id} from Turso: {e}")
 
     async def _save_log_entry(self, guild_id: int, category: str, log_data: Dict):
         """Save individual log entries to JSON files with size limits and error handling."""
@@ -1346,7 +1334,7 @@ class Logging(commands.Cog):
             }
 
             self.config_cache[guild_id] = config
-            await self._save_config()
+            await self._save_config(guild_id)
             pass
         except Exception as e:
             logger.error(f"Error saving config for guild {guild_id}: {e}")
@@ -1828,7 +1816,7 @@ class Logging(commands.Cog):
         try:
             if ctx.guild.id in self.config_cache:
                 del self.config_cache[ctx.guild.id]
-                await self._save_config()
+                await self._delete_config(ctx.guild.id)
 
                 embed = self._create_modern_embed(
                     "Configuration Reset",
@@ -2997,3 +2985,4 @@ class Logging(commands.Cog):
 async def setup(bot):
     """Setup function for the cog."""
     await bot.add_cog(Logging(bot))
+    
