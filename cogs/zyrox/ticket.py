@@ -13,3 +13,4 @@ class _ticket(commands.Cog):
     @commands.group()
     async def __Ticket__(self, ctx: commands.Context):
         """`/ticket setup`, `/ticket panels`, `/ticket delete`, `/ticket category add`, `/ticket category remove`, `/ticket color`, `/ticket close`, `/ticket lock`, `/ticket claim`, `/ticket unlock`, `/ticket transcript`"""
+        
