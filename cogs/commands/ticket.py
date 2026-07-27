@@ -676,6 +676,49 @@ class TicketCog(commands.Cog, name="Ticket System"):
         embed = discord.Embed(title="Ticket Panels", description="\n".join(lines), color=EMBED_COLOR)
         await ctx.send(embed=embed, ephemeral=True)
 
+    @ticket.command(name="delete", description="Delete an entire ticket panel (and its categories).")
+    @commands.has_permissions(manage_guild=True)
+    @app_commands.describe(panel="Which panel to delete.")
+    async def delete_panel(self, ctx, panel: str):
+        await ctx.defer(ephemeral=True)
+        guild = ctx.guild
+        panel_row = await self.resolve_panel(guild.id, panel)
+        if not panel_row:
+            return await ctx.send(f"{ERROR_EMOJI} No panel named `{panel}` found.", ephemeral=True)
+        panel_id = panel_row['panel_id']
+
+        # امسح الديسكورد كاتيجوريز الخاصة بالبانل ده، بس لو مش مستخدمة في بانل تاني
+        cats = await self.db.fetchall("SELECT * FROM ticket_categories WHERE panel_id=?", (panel_id,))
+        for cat in cats:
+            still_used = await self.db.fetchone(
+                "SELECT 1 FROM ticket_categories WHERE guild_id=? AND discord_category_id=? AND panel_id!=?",
+                (guild.id, cat['discord_category_id'], panel_id)
+            )
+            if not still_used and (disc_cat := guild.get_channel(cat['discord_category_id'])):
+                try: await disc_cat.delete()
+                except Exception: pass
+
+        await self.db.execute("DELETE FROM ticket_categories WHERE panel_id=?", (panel_id,))
+
+        # امسح رسالة البانل نفسها لو موجودة
+        if panel_row['panel_channel_id'] and panel_row['panel_message_id']:
+            channel = guild.get_channel(panel_row['panel_channel_id'])
+            if channel:
+                try:
+                    msg = await channel.fetch_message(panel_row['panel_message_id'])
+                    await msg.delete()
+                except Exception:
+                    pass
+
+        await self.db.execute("DELETE FROM ticket_panels WHERE panel_id=?", (panel_id,))
+
+        await ctx.send(f"{SUCCESS_EMOJI} Panel `{panel}` and its categories have been deleted.", ephemeral=True)
+
+    @delete_panel.autocomplete('panel')
+    async def delete_panel_autocomplete(self, interaction: discord.Interaction, current: str):
+        panels = await self.db.fetchall("SELECT panel_name FROM ticket_panels WHERE guild_id=?", (interaction.guild.id,))
+        return [app_commands.Choice(name=p['panel_name'], value=p['panel_name']) for p in panels if current.lower() in p['panel_name'].lower()][:25]
+
     @ticket.group(name="category", description="Add or remove buttons/options from one of your ticket panels.")
     @commands.has_permissions(manage_guild=True)
     async def category(self, ctx):
