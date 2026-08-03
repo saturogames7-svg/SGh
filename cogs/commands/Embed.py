@@ -1,5 +1,5 @@
-import os
 import json
+import logging
 import discord
 from utils.emoji import CROSS, TICK
 from discord.ext import commands
@@ -8,51 +8,36 @@ import asyncio
 from utils.Tools import *
 import re
 
-import libsql
+from utils.turso_db import execute
 
-# --- Turso / libSQL connection ---------------------------------------------
-# TURSO_DATABASE_URL falls back to the URL you gave me, but it's best to also
-# set it as an env var (same as TURSO_AUTH_TOKEN) rather than hardcoding it.
-TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "libsql://sghub-sat-uro.aws-us-east-1.turso.io")
-TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+logger = logging.getLogger(__name__)
 
 
 class TemplateDB:
     """Stores/retrieves embed templates in Turso, keyed by (guild_id, name).
 
-    libsql's Python client is sync (sqlite3-style), so every call here is
-    pushed to a thread via asyncio.to_thread to avoid blocking the bot's
-    event loop.
+    Goes through utils.turso_db.execute() so this shares the bot's one
+    persistent libsql_client connection and its reconnect-on-failure logic,
+    instead of opening a connection of its own.
     """
 
-    def __init__(self):
-        self._conn = None
-
-    def _connect(self):
-        if self._conn is None:
-            self._conn = libsql.connect(
-                database=TURSO_DATABASE_URL,
-                auth_token=TURSO_AUTH_TOKEN,
+    async def ensure_table(self):
+        await execute(
+            """
+            CREATE TABLE IF NOT EXISTS embed_templates (
+                guild_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_by TEXT,
+                updated_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (guild_id, name)
             )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS embed_templates (
-                    guild_id TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    data TEXT NOT NULL,
-                    created_by TEXT,
-                    updated_at TEXT DEFAULT (datetime('now')),
-                    PRIMARY KEY (guild_id, name)
-                )
-                """
-            )
-            self._conn.commit()
-        return self._conn
+            """
+        )
 
-    # ---- blocking helpers (run in a thread) --------------------------------
-    def _save(self, guild_id, name, data, created_by):
-        conn = self._connect()
-        conn.execute(
+    async def save(self, guild_id, name, embed_data, created_by):
+        payload = json.dumps(embed_data)
+        await execute(
             """
             INSERT INTO embed_templates (guild_id, name, data, created_by, updated_at)
             VALUES (?, ?, ?, ?, datetime('now'))
@@ -61,49 +46,30 @@ class TemplateDB:
                 created_by = excluded.created_by,
                 updated_at = excluded.updated_at
             """,
-            (str(guild_id), name, data, str(created_by)),
+            [str(guild_id), name, payload, str(created_by)],
         )
-        conn.commit()
-
-    def _load(self, guild_id, name):
-        conn = self._connect()
-        cur = conn.execute(
-            "SELECT data FROM embed_templates WHERE guild_id = ? AND name = ?",
-            (str(guild_id), name),
-        )
-        row = cur.fetchone()
-        return row[0] if row else None
-
-    def _list(self, guild_id):
-        conn = self._connect()
-        cur = conn.execute(
-            "SELECT name FROM embed_templates WHERE guild_id = ? ORDER BY name COLLATE NOCASE",
-            (str(guild_id),),
-        )
-        return [r[0] for r in cur.fetchall()]
-
-    def _delete(self, guild_id, name):
-        conn = self._connect()
-        conn.execute(
-            "DELETE FROM embed_templates WHERE guild_id = ? AND name = ?",
-            (str(guild_id), name),
-        )
-        conn.commit()
-
-    # ---- async-facing API ---------------------------------------------------
-    async def save(self, guild_id, name, embed_data, created_by):
-        payload = json.dumps(embed_data)
-        await asyncio.to_thread(self._save, guild_id, name, payload, created_by)
 
     async def load(self, guild_id, name):
-        raw = await asyncio.to_thread(self._load, guild_id, name)
-        return json.loads(raw) if raw else None
+        rs = await execute(
+            "SELECT data FROM embed_templates WHERE guild_id = ? AND name = ?",
+            [str(guild_id), name],
+        )
+        if not rs.rows:
+            return None
+        return json.loads(rs.rows[0]["data"])
 
     async def list_names(self, guild_id):
-        return await asyncio.to_thread(self._list, guild_id)
+        rs = await execute(
+            "SELECT name FROM embed_templates WHERE guild_id = ? ORDER BY name COLLATE NOCASE",
+            [str(guild_id)],
+        )
+        return [row["name"] for row in rs.rows]
 
     async def delete(self, guild_id, name):
-        await asyncio.to_thread(self._delete, guild_id, name)
+        await execute(
+            "DELETE FROM embed_templates WHERE guild_id = ? AND name = ?",
+            [str(guild_id), name],
+        )
 
 
 class EmbedBuilder(ui.LayoutView):
@@ -483,6 +449,12 @@ class Embed(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.db = TemplateDB()
+
+    async def cog_load(self):
+        try:
+            await self.db.ensure_table()
+        except Exception as e:
+            logger.error(f"Failed to ensure embed_templates table exists: {e}")
 
     @commands.hybrid_command(name="embed")
     @blacklist_check()
