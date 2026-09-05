@@ -38,6 +38,11 @@ class TypeRacer:
         2: "🥈",
         3: "🥉",
     }
+    TYPERACER_REWARDS: ClassVar[dict[int, tuple[int, int]]] = {
+        1: (20, 30),
+        2: (10, 20),
+        3: (5, 15),
+    }
 
     @executor()
     def _tr_img(self, text: str, font: str) -> BytesIO:
@@ -57,7 +62,8 @@ class TypeRacer:
             return buffer
 
     def format_line(self, i: int, data: UserData) -> str:
-        return f" • {self.EMOJI_MAP[i]} | {data['user'].mention} in {data['time']:.2f}s | **WPM:** {data['wpm']:.2f} | **ACC:** {data['acc']:.2f}%"
+        reward_text = f" | +{data['reward']} 🪙" if "reward" in data else ""
+        return f" • {self.EMOJI_MAP[i]} | {data['user'].mention} in {data['time']:.2f}s | **WPM:** {data['wpm']:.2f} | **ACC:** {data['acc']:.2f}%{reward_text}"
 
     async def wait_for_tr_response(
         self,
@@ -103,14 +109,22 @@ class TypeRacer:
             content = message.content.lower().replace("\n", " ")
             timeout -= round(end - start)
 
+            rank = len(winners) + 1
+            reward = random.randint(*self.TYPERACER_REWARDS[rank])
+
             winners.append(
                 {
                     "user": message.author,
                     "time": end - start,
                     "wpm": len(text.split()) / ((end - start) / 60),
                     "acc": difflib.SequenceMatcher(None, content, text).ratio() * 100,
+                    "reward": reward,
                 }
             )
+
+            eco = ctx.bot.get_cog("Economy")
+            if eco:
+                await eco.add_balance(ctx.guild.id, message.author.id, reward)
 
             self.embed.description += (
                 self.format_line(len(winners), winners[len(winners) - 1]) + "\n"
@@ -229,3 +243,4 @@ class TypeRacer:
             ctx, text, timeout=timeout, min_accuracy=min_accuracy
         )
         return self.message
+        
