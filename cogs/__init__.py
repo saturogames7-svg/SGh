@@ -26,6 +26,7 @@ from .commands.block import Block
 from .commands.nightmode import Nightmode
 from .commands.tracking import Tracking
 from .commands.owner import Badges
+from .commands.economy import EconomyCog
 #from .commands.map import Map
 from .commands.autoresponder import AutoResponder
 from .commands.customrole import Customrole
@@ -91,6 +92,7 @@ from .zyrox.extra import _extra
 from .zyrox.general import _general
 from .zyrox.automod import _automod 
 from .zyrox.moderation import _moderation
+from .zyrox.economy import _economy
 #from .zyrox.inviteTracker import _inviteTracker
 from .zyrox.music import _music
 from .zyrox.fun import _fun
@@ -226,6 +228,7 @@ async def setup(bot: zyrox):
   await bot.add_cog(FilterCog(bot))
   await bot.add_cog(Global(bot))
  # await bot.add_cog(Map(bot))
+  await bot.add_cog(EconomyCog(bot))
   await bot.add_cog(TicketCog(bot))
   await bot.add_cog(Logging(bot))
   await bot.add_cog(QR(bot))
@@ -256,6 +259,7 @@ async def setup(bot: zyrox):
   await bot.add_cog(_general(bot))
   await bot.add_cog(_automod(bot))  
   await bot.add_cog(_moderation(bot))
+  await bot.add_cog(_economy(bot))
   await bot.add_cog(_music(bot))
   await bot.add_cog(_fun(bot))
   await bot.add_cog(_games(bot))
@@ -357,8 +361,3 @@ async def setup(bot: zyrox):
   await bot.add_cog(TopCheck(bot))
   await bot.add_cog(Snipe(bot))
   
-
-
-  for cog in cogs_to_load:
-    print(Fore.RED + Style.BRIGHT + f"Loaded cog: {cog.__name__}")
-  print(Fore.RED + Style.BRIGHT + f"All {BotName} Cogs loaded successfully.")
