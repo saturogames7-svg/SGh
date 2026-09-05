@@ -943,6 +943,21 @@ class TicketCog(commands.Cog, name="Ticket System"):
     @commands.has_permissions(manage_channels=True)
     async def claim(self, ctx): await self._dispatch_action(ctx, "claim")
 
+    @ticket.command(name="add", description="Add a member to this ticket channel.")
+    @commands.has_permissions(manage_channels=True)
+    @app_commands.describe(member="The member you want to add to this ticket.")
+    async def add_member(self, ctx, member: discord.Member):
+        ephemeral = True if ctx.interaction else False
+        t = await self.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (ctx.channel.id,))
+        if not t:
+            return await ctx.send(f"{ERROR_EMOJI} This isn't a ticket channel.", ephemeral=ephemeral)
+        if t['closed_at']:
+            return await ctx.send(f"{ERROR_EMOJI} This ticket is closed, you can't add members to a closed ticket.", ephemeral=ephemeral)
+
+        await ctx.channel.set_permissions(member, view_channel=True, send_messages=True)
+        await ctx.send(f"{SUCCESS_EMOJI} {member.mention} has been added to this ticket by {ctx.author.mention}.")
+        await log_ticket_action(self.db, ctx.guild, ctx.author, "Member Added", f"{member.mention} added to {ctx.channel.mention} by {ctx.author.mention}.")
+
     @ticket.command(name="transcript", description="Generate a transcript of a closed ticket.")
     @commands.has_permissions(manage_channels=True)
     async def transcript(self, ctx):
@@ -1126,4 +1141,5 @@ async def setup(bot):
         traceback.print_exc()
         print("=" * 60)
         raise
-        
+
+
