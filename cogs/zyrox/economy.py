@@ -11,5 +11,4 @@ class _economy(commands.Cog):
         return emoji, label, description
     @commands.group()
     async def __Economy__(self, ctx: commands.Context):
-        """`/balance`, `/leaderboard`, `/pay`, `/give-money`, `/remove-money`, `/store list`, `/store add`, `/store remove`, `/store buy`, `/inventory`"""
- 
+        """`/economy balance`, `/economy leaderboard`, `/economy pay`, `/economy give-money`, `/economy remove-money`, `/economy inventory`, `/economy store list`, `/economy store add`, `/economy store remove`, `/economy store buy`"""
