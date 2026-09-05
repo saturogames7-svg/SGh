@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import pathlib
@@ -24,6 +23,9 @@ GRAY: Final[tuple[int, int, int]] = (119, 123, 125)
 ORANGE: Final[tuple[int, int, int]] = (200, 179, 87)
 GREEN: Final[tuple[int, int, int]] = (105, 169, 99)
 LGRAY: Final[tuple[int, int, int]] = (198, 201, 205)
+
+WORDLE_REWARD_MIN: Final[int] = 10
+WORDLE_REWARD_MAX: Final[int] = 20
 
 
 class Wordle:
@@ -172,7 +174,11 @@ class Wordle:
                 )
 
                 if won:
-                    await ctx.send("Game Over! You won!")
+                    reward = random.randint(WORDLE_REWARD_MIN, WORDLE_REWARD_MAX)
+                    eco = ctx.bot.get_cog("Economy")
+                    if eco:
+                        await eco.add_balance(ctx.guild.id, ctx.author.id, reward)
+                    await ctx.send(f"Game Over! You won! You earned **{reward}** coins 🪙")
                     break
                 elif len(self.guesses) >= 6:
                     await ctx.send(
@@ -181,3 +187,4 @@ class Wordle:
                     break
 
         return self.message
+        
