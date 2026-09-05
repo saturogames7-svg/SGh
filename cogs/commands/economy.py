@@ -348,7 +348,7 @@ class EconomyCog(commands.Cog, name="Economy"):
         return [app_commands.Choice(name=i['name'], value=i['name']) for i in items if current.lower() in i['name'].lower()][:25]
 
     # --- Inventory ---
-    @commands.hybrid_command(name="inventory", aliases=["inv"], description="See what a member has bought from the store.")
+    @commands.hybrid_command(name="inventory", description="See what a member has bought from the store.")
     @app_commands.describe(member="The member whose inventory you want to check (defaults to you).")
     @commands.guild_only()
     async def inventory(self, ctx: Context, member: discord.Member = None):
@@ -374,4 +374,4 @@ async def setup(bot):
         traceback.print_exc()
         print("=" * 60)
         raise
-
+        
