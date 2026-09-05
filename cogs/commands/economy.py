@@ -41,20 +41,37 @@ CRIME_FAIL_MIN, CRIME_FAIL_MAX = 30, 100
 DAILY_COOLDOWN = 24 * 60 * 60    # 24 hours
 DAILY_MIN, DAILY_MAX = 100, 250
 
-# --- Store display: the store message now uses Discord's newer
-# "Components V2" layout (discord.ui.LayoutView / Container / Section)
-# so each item renders as its own row: emoji+name on the left, a button
-# showing just the price on the right that instantly buys it (matches
-# the row-style store layout, e.g. UnbelievaBoat's store card).
-# Requires discord.py >= 2.6 (that's when discord.ui.Section landed).
-#
-# V2 messages cap out at 40 total components INCLUDING nested ones. Each
-# item row costs 3 components (Section + its TextDisplay + its Button
-# accessory), plus ~3 more for the container/header/separator, so we cap
-# the buttoned rows well under that limit. A guild can still stock up to
-# MAX_SHOP_ITEMS_PER_GUILD items - anything beyond the buttoned rows is
-# still purchasable with /economy store buy <name>.
-MAX_STORE_BUTTON_ITEMS = 10
+# --- Trivia: no risk of losing coins, just a modest reward for a correct
+# answer - the 15-minute per-member cooldown (same pattern as work/crime/
+# daily, tracked via wallets.last_trivia) is what stops someone from
+# farming it back-to-back all day. ---
+TRIVIA_COOLDOWN = 15 * 60        # 15 minutes
+TRIVIA_MIN, TRIVIA_MAX = 10, 25
+TRIVIA_TIMEOUT_SECONDS = 30
+
+TRIVIA_QUESTIONS = [
+    # (question, [options...], correct_option_index)
+    ("What is the largest planet in our solar system?", ["Earth", "Jupiter", "Saturn", "Neptune"], 1),
+    ("Which country is home to the kangaroo?", ["South Africa", "Brazil", "Australia", "India"], 2),
+    ("What is the chemical symbol for gold?", ["Ag", "Au", "Gd", "Go"], 1),
+    ("How many continents are there on Earth?", ["5", "6", "7", "8"], 2),
+    ("Who wrote the play 'Romeo and Juliet'?", ["Charles Dickens", "William Shakespeare", "Mark Twain", "Jane Austen"], 1),
+    ("What is the capital city of Japan?", ["Seoul", "Beijing", "Tokyo", "Bangkok"], 2),
+    ("Which ocean is the largest in the world?", ["Atlantic", "Indian", "Arctic", "Pacific"], 3),
+    ("How many legs does a spider have?", ["6", "8", "10", "12"], 1),
+    ("What is the tallest mountain in the world?", ["K2", "Mount Kilimanjaro", "Mount Everest", "Denali"], 2),
+    ("Which planet is known as the Red Planet?", ["Venus", "Mars", "Mercury", "Jupiter"], 1),
+    ("What is the smallest prime number?", ["0", "1", "2", "3"], 2),
+    ("Which language has the most native speakers worldwide?", ["English", "Hindi", "Spanish", "Mandarin Chinese"], 3),
+    ("What is the freezing point of water in Celsius?", ["0°C", "32°C", "-1°C", "100°C"], 0),
+    ("Which country gifted the Statue of Liberty to the USA?", ["United Kingdom", "France", "Spain", "Italy"], 1),
+    ("How many players are on a standard soccer team on the field?", ["9", "10", "11", "12"], 2),
+    ("What gas do plants absorb from the atmosphere for photosynthesis?", ["Oxygen", "Nitrogen", "Carbon dioxide", "Hydrogen"], 2),
+    ("Which organ in the human body pumps blood?", ["Lungs", "Liver", "Heart", "Kidney"], 2),
+    ("What is the currency of Japan?", ["Won", "Yuan", "Yen", "Ringgit"], 2),
+    ("In which year did the Titanic sink?", ["1905", "1912", "1918", "1923"], 1),
+    ("Which desert is the largest in the world?", ["Sahara", "Gobi", "Antarctic", "Arabian"], 2),
+]
 
 WORK_MESSAGES = [
     "You delivered packages all day and earned",
@@ -107,15 +124,106 @@ def fmt_cooldown(seconds: int) -> str:
     return " ".join(parts)
 
 
+# --- Trivia buttons/view ---
+class TriviaButton(discord.ui.Button):
+    def __init__(self, label: str, index: int):
+        # 2 buttons per row so 4 options render as a neat 2x2 grid.
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, row=index // 2)
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view: TriviaView = self.view
+        await view.answer(interaction, self.index)
+
+
+class TriviaView(discord.ui.View):
+    """A single trivia question with up to 4 answer buttons. Only the
+    member who triggered /economy trivia can answer it."""
+
+    def __init__(self, cog: "EconomyCog", guild_id: int, player: discord.Member,
+                 question: str, options: list[str], correct_index: int):
+        super().__init__(timeout=TRIVIA_TIMEOUT_SECONDS)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.player = player
+        self.question = question
+        self.options = options
+        self.correct_index = correct_index
+        self.answered = False
+        self.message: discord.Message | None = None
+
+        for i, option in enumerate(options):
+            self.add_item(TriviaButton(option, i))
+
+    def _result_embed(self, *, correct: bool | None, reward: int = 0, timed_out: bool = False) -> discord.Embed:
+        if timed_out:
+            color = 0x95A5A6
+        else:
+            color = 0x2ECC71 if correct else 0xE74C3C
+
+        embed = discord.Embed(title="🧠 Trivia", description=self.question, color=color)
+        embed.set_author(name=self.player.display_name, icon_url=self.player.display_avatar.url)
+
+        if timed_out:
+            embed.add_field(
+                name="Result",
+                value=f"⌛ Time's up! The correct answer was **{self.options[self.correct_index]}**.",
+                inline=False,
+            )
+        elif correct:
+            embed.add_field(name="Result", value=f"✅ Correct! You earned {fmt_amount(reward)}.", inline=False)
+        else:
+            embed.add_field(
+                name="Result",
+                value=f"❌ Wrong! The correct answer was **{self.options[self.correct_index]}**.",
+                inline=False,
+            )
+        return embed
+
+    def _lock_buttons(self, chosen_index: int | None):
+        for child in self.children:
+            child.disabled = True
+            if child.index == self.correct_index:
+                child.style = discord.ButtonStyle.success
+            elif chosen_index is not None and child.index == chosen_index:
+                child.style = discord.ButtonStyle.danger
+
+    async def answer(self, interaction: discord.Interaction, index: int):
+        if interaction.user.id != self.player.id:
+            return await interaction.response.send_message(f"{ERROR_EMOJI} This isn't your question.", ephemeral=True)
+        if self.answered:
+            return await interaction.response.defer()
+
+        self.answered = True
+        correct = index == self.correct_index
+        self._lock_buttons(index)
+
+        reward = 0
+        if correct:
+            reward = random.randint(TRIVIA_MIN, TRIVIA_MAX)
+            await self.cog.add_balance(self.guild_id, self.player.id, reward)
+
+        self.stop()
+        await interaction.response.edit_message(embed=self._result_embed(correct=correct, reward=reward), view=self)
+
+    async def on_timeout(self):
+        if self.answered:
+            return
+        self._lock_buttons(None)
+        if self.message:
+            try:
+                await self.message.edit(embed=self._result_embed(correct=None, timed_out=True), view=self)
+            except discord.HTTPException:
+                pass
+
+
 # --- Store buttons: instant-buy directly from the /economy store list message.
 class StoreBuyButton(discord.ui.Button):
     def __init__(self, item: dict):
-        # Only the price is shown on the button itself now - the item's
-        # name/emoji is shown as the row text next to it (see
-        # StoreItemSection below).
+        emoji, label_name = split_item_emoji(item["name"])
         super().__init__(
-            label=f"{item['price']:,}",
-            emoji=COIN_EMOJI,
+            label=f"{label_name} — {item['price']:,}",
+            emoji=emoji,
             style=discord.ButtonStyle.green,
         )
         self.item_id = item["item_id"]
@@ -171,32 +279,11 @@ class StoreBuyButton(discord.ui.Button):
         )
 
 
-class StoreItemSection(discord.ui.Section):
-    """One row of the store: the item's emoji+name as text on the left,
-    and its price as a button accessory on the right that instantly buys
-    it when clicked."""
-    def __init__(self, item: dict):
-        emoji, label_name = split_item_emoji(item["name"])
-        super().__init__(
-            discord.ui.TextDisplay(f"{emoji}  **{label_name}**"),
-            accessory=StoreBuyButton(item),
-        )
-
-
-class StoreView(discord.ui.LayoutView):
-    """Components V2 layout for the store message. Replaces the old
-    embed-plus-button-grid with one row per item (name left, price
-    button right)."""
+class StoreView(discord.ui.View):
     def __init__(self, items: list[dict]):
         super().__init__(timeout=None)
-        container = discord.ui.Container(accent_color=STORE_EMBED_COLOR)
-        container.add_item(discord.ui.TextDisplay(
-            "🛒 **Store**\nClick a button to instantly buy an item, or use `/economy store buy <name>`."
-        ))
-        container.add_item(discord.ui.Separator())
-        for item in items[:MAX_STORE_BUTTON_ITEMS]:
-            container.add_item(StoreItemSection(item))
-        self.add_item(container)
+        for item in items[:25]:
+            self.add_item(StoreBuyButton(item))
 
 
 # --- Database Class (Turso) ---
@@ -223,8 +310,9 @@ class EconomyDatabase:
     # wallets uses a composite PK (guild_id, user_id) so it's handled like
     # user_ticket_counts in ticket.py - a raw CREATE TABLE, with _migrate()
     # still able to add future columns since it only inspects columns.
-    # last_work/last_crime/last_daily store unix timestamps (seconds) of
-    # the last time each income command was used, for cooldown checks.
+    # last_work/last_crime/last_daily/last_trivia store unix timestamps
+    # (seconds) of the last time each income command was used, for
+    # cooldown checks.
     WALLETS_SCHEMA = {
         "guild_id": "INTEGER",
         "user_id": "INTEGER",
@@ -232,6 +320,7 @@ class EconomyDatabase:
         "last_work": "INTEGER DEFAULT 0",
         "last_crime": "INTEGER DEFAULT 0",
         "last_daily": "INTEGER DEFAULT 0",
+        "last_trivia": "INTEGER DEFAULT 0",
     }
 
     def __init__(self):
@@ -344,7 +433,7 @@ class EconomyCog(commands.Cog, name="Economy"):
         )
 
     async def get_cooldown_remaining(self, guild_id: int, user_id: int, column: str, cooldown_seconds: int) -> int:
-        """Returns seconds remaining before `column` (last_work/last_crime/last_daily)
+        """Returns seconds remaining before `column` (last_work/last_crime/last_daily/last_trivia)
         is off cooldown for this member. 0 or negative means ready to use."""
         row = await self.db.fetchone(
             f"SELECT {column} FROM wallets WHERE guild_id=? AND user_id=?", (guild_id, user_id)
@@ -417,6 +506,29 @@ class EconomyCog(commands.Cog, name="Economy"):
         await self.set_cooldown(ctx.guild.id, ctx.author.id, "last_daily")
 
         await ctx.send(f"🎁 You claimed your daily reward of {fmt_amount(amount)}!")
+
+    # --- Games ---
+    @economy.command(name="trivia", description="Answer a trivia question correctly for some coins.")
+    async def trivia(self, ctx: Context):
+        remaining = await self.get_cooldown_remaining(ctx.guild.id, ctx.author.id, "last_trivia", TRIVIA_COOLDOWN)
+        if remaining > 0:
+            return await ctx.send(f"{ERROR_EMOJI} You've already played trivia recently. Try again in **{fmt_cooldown(remaining)}**.", ephemeral=True)
+
+        # Cooldown is set immediately (before the answer), same pattern as
+        # /economy crime - so re-rolling the question doesn't reset the timer.
+        await self.set_cooldown(ctx.guild.id, ctx.author.id, "last_trivia")
+
+        question, options, correct_index = random.choice(TRIVIA_QUESTIONS)
+        shuffled = list(enumerate(options))
+        random.shuffle(shuffled)
+        shuffled_options = [option for _, option in shuffled]
+        shuffled_correct_index = next(i for i, (orig_i, _) in enumerate(shuffled) if orig_i == correct_index)
+
+        embed = discord.Embed(title="🧠 Trivia", description=question, color=EMBED_COLOR)
+        embed.set_footer(text="You have 30 seconds to answer.")
+
+        view = TriviaView(self, ctx.guild.id, ctx.author, question, shuffled_options, shuffled_correct_index)
+        view.message = await ctx.send(embed=embed, view=view)
 
     # --- Wallet / Balance ---
     @economy.command(name="balance", aliases=["bal", "wallet"], description="Check your or another member's coin balance.")
@@ -525,17 +637,19 @@ class EconomyCog(commands.Cog, name="Economy"):
         if not rows:
             return await ctx.send(f"{ERROR_EMOJI} The store is empty. An admin can add items with `/economy store add`.", ephemeral=True)
 
-        view = StoreView(rows)
+        lines = []
+        for r in rows:
+            emoji, label = split_item_emoji(r['name'])
+            lines.append(f"{emoji}  **{label}**\n{fmt_amount(r['price'])}")
 
-        # Always send as a fresh, standalone message - never as a reply to
-        # the invoking message. (mention_author only matters for prefix
-        # invocation; slash-command responses are never shown as replies
-        # in the first place, and passing reply-only kwargs to an
-        # interaction response would error, hence the guard.)
-        send_kwargs = {"view": view}
-        if ctx.interaction is None:
-            send_kwargs["mention_author"] = False
-        await ctx.send(**send_kwargs)
+        embed = discord.Embed(
+            title="🛒 Store",
+            description="Click a button below to instantly buy an item, or use `/economy store buy <name>`.\n\n" + "\n\n".join(lines),
+            color=STORE_EMBED_COLOR,
+        )
+
+        view = StoreView(rows)
+        await ctx.send(embed=embed, view=view)
 
     @store.command(name="add", description="[Admin] Add a new item to the store.")
     @app_commands.describe(
