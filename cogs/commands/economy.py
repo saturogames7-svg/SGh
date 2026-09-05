@@ -12,7 +12,7 @@ from utils.config import *
 from utils.turso_db import get_client
 
 # --- Configurable Variables ---
-EMBED_COLOR = 0xFF0000
+EMBED_COLOR = 0x3498DB
 STORE_EMBED_COLOR = 0x3498DB
 COIN_EMOJI = "🪙"
 CURRENCY_NAME = "Coins"
