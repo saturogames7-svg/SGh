@@ -10,6 +10,7 @@ from utils.turso_db import get_client
 
 # --- Configurable Variables ---
 EMBED_COLOR = 0xFF0000
+STORE_EMBED_COLOR = 0x3498DB
 COIN_EMOJI = "🪙"
 CURRENCY_NAME = "Coins"
 STARTING_BALANCE = 0
@@ -286,16 +287,9 @@ class EconomyCog(commands.Cog, name="Economy"):
         if not rows:
             return await ctx.send(f"{ERROR_EMOJI} The store is empty. An admin can add items with `/economy store add`.", ephemeral=True)
 
-        lines = []
-        for r in rows:
-            line = f"**{r['name']}** — {fmt_amount(r['price'])}"
-            if r["role_id"]:
-                role = ctx.guild.get_role(r["role_id"])
-                if role:
-                    line += f" *(grants {role.mention})*"
-            lines.append(line)
+        lines = [f"**{r['name']}** — {fmt_amount(r['price'])}" for r in rows]
 
-        embed = discord.Embed(title="🛒 Store", description="\n".join(lines), color=EMBED_COLOR)
+        embed = discord.Embed(title="🛒 Store", description="\n".join(lines), color=STORE_EMBED_COLOR)
         embed.set_footer(text="Use /economy store buy <name> to purchase an item.")
         await ctx.send(embed=embed)
 
