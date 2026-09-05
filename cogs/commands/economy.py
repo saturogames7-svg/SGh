@@ -147,7 +147,9 @@ class EconomyCog(commands.Cog, name="Economy"):
         return (row["n"] if row else 0) + 1
 
     async def add_balance(self, guild_id: int, user_id: int, amount: int):
-        """Adds (or subtracts, if amount is negative) coins for a member. Creates the wallet row if missing."""
+        """Adds (or subtracts, if amount is negative) coins for a member. Creates the wallet row if missing.
+        Public helper: other cogs can call bot.get_cog("Economy").add_balance(...) to award coins
+        (e.g. for winning a game) without touching this file."""
         await self.db.execute(
             "INSERT INTO wallets (guild_id, user_id, balance) VALUES (?,?,?) "
             "ON CONFLICT(guild_id,user_id) DO UPDATE SET balance=balance+excluded.balance",
@@ -167,10 +169,19 @@ class EconomyCog(commands.Cog, name="Economy"):
             "SELECT * FROM shop_items WHERE guild_id=? AND LOWER(name)=LOWER(?)", (guild_id, name)
         )
 
-    # --- Wallet / Balance ---
-    @commands.hybrid_command(name="balance", aliases=["bal", "wallet"], description="Check your or another member's coin balance.")
-    @app_commands.describe(member="The member whose balance you want to check (defaults to you).")
+    # --- Root group: everything lives under /economy so the whole feature
+    # only costs ONE global slash-command slot (Discord caps a bot at 100
+    # top-level application commands; a group with subcommands still only
+    # counts as 1, no matter how many subcommands it has). ---
+    @commands.hybrid_group(name="economy", aliases=["eco"], description="Coins, the store, and everything money-related.")
     @commands.guild_only()
+    async def economy(self, ctx: Context):
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help(ctx.command)
+
+    # --- Wallet / Balance ---
+    @economy.command(name="balance", aliases=["bal", "wallet"], description="Check your or another member's coin balance.")
+    @app_commands.describe(member="The member whose balance you want to check (defaults to you).")
     async def balance(self, ctx: Context, member: discord.Member = None):
         member = member or ctx.author
         bal = await self.get_balance(ctx.guild.id, member.id)
@@ -182,9 +193,8 @@ class EconomyCog(commands.Cog, name="Economy"):
         embed.set_thumbnail(url=member.display_avatar.url)
         await ctx.send(embed=embed)
 
-    @commands.hybrid_command(name="leaderboard", aliases=["lb"], description="Show the server's richest members.")
+    @economy.command(name="leaderboard", aliases=["lb"], description="Show the server's richest members.")
     @app_commands.describe(page="Which page of the leaderboard to view (defaults to 1).")
-    @commands.guild_only()
     async def leaderboard(self, ctx: Context, page: int = 1):
         page = max(1, page)
         offset = (page - 1) * LEADERBOARD_PAGE_SIZE
@@ -206,9 +216,8 @@ class EconomyCog(commands.Cog, name="Economy"):
         embed.set_footer(text=f"Page {page}")
         await ctx.send(embed=embed)
 
-    @commands.hybrid_command(name="pay", description="Send some of your coins to another member.")
+    @economy.command(name="pay", description="Send some of your coins to another member.")
     @app_commands.describe(member="The member you want to pay.", amount="How many coins to send.")
-    @commands.guild_only()
     async def pay(self, ctx: Context, member: discord.Member, amount: int):
         if amount <= 0:
             return await ctx.send(f"{ERROR_EMOJI} Amount must be greater than 0.", ephemeral=True)
@@ -226,10 +235,9 @@ class EconomyCog(commands.Cog, name="Economy"):
         await ctx.send(f"{PAY_EMOJI} {ctx.author.mention} paid {fmt_amount(amount)} to {member.mention}.")
 
     # --- Admin: manual balance adjustments ---
-    @commands.hybrid_command(name="give-money", description="[Admin] Add coins to a member's balance.")
+    @economy.command(name="give-money", description="[Admin] Add coins to a member's balance.")
     @app_commands.describe(member="The member to give coins to.", amount="How many coins to add.")
     @commands.has_permissions(manage_guild=True)
-    @commands.guild_only()
     async def give_money(self, ctx: Context, member: discord.Member, amount: int):
         if amount <= 0:
             return await ctx.send(f"{ERROR_EMOJI} Amount must be greater than 0.", ephemeral=True)
@@ -237,10 +245,9 @@ class EconomyCog(commands.Cog, name="Economy"):
         new_balance = await self.get_balance(ctx.guild.id, member.id)
         await ctx.send(f"{SUCCESS_EMOJI} Gave {fmt_amount(amount)} to {member.mention}. New balance: {fmt_amount(new_balance)}.")
 
-    @commands.hybrid_command(name="remove-money", description="[Admin] Remove coins from a member's balance.")
+    @economy.command(name="remove-money", description="[Admin] Remove coins from a member's balance.")
     @app_commands.describe(member="The member to remove coins from.", amount="How many coins to remove.")
     @commands.has_permissions(manage_guild=True)
-    @commands.guild_only()
     async def remove_money(self, ctx: Context, member: discord.Member, amount: int):
         if amount <= 0:
             return await ctx.send(f"{ERROR_EMOJI} Amount must be greater than 0.", ephemeral=True)
@@ -249,9 +256,24 @@ class EconomyCog(commands.Cog, name="Economy"):
         await self.set_balance(ctx.guild.id, member.id, new_balance)
         await ctx.send(f"{SUCCESS_EMOJI} Removed {fmt_amount(amount)} from {member.mention}. New balance: {fmt_amount(new_balance)}.")
 
-    # --- Store ---
-    @commands.hybrid_group(name="store", description="Browse or manage this server's coin store.")
-    @commands.guild_only()
+    # --- Inventory ---
+    @economy.command(name="inventory", aliases=["inv"], description="See what a member has bought from the store.")
+    @app_commands.describe(member="The member whose inventory you want to check (defaults to you).")
+    async def inventory(self, ctx: Context, member: discord.Member = None):
+        member = member or ctx.author
+        rows = await self.db.fetchall(
+            "SELECT item_name, purchased_at FROM inventory WHERE guild_id=? AND user_id=? ORDER BY purchased_at DESC",
+            (ctx.guild.id, member.id)
+        )
+        if not rows:
+            return await ctx.send(f"{ERROR_EMOJI} {member.mention} hasn't bought anything from the store yet.", ephemeral=True)
+
+        lines = [f"• **{r['item_name']}**" for r in rows]
+        embed = discord.Embed(title=f"🎒 {member.display_name}'s Inventory", description="\n".join(lines), color=EMBED_COLOR)
+        await ctx.send(embed=embed)
+
+    # --- Store (nested subcommand-group: /economy store <list|add|remove|buy>) ---
+    @economy.group(name="store", description="Browse or manage this server's coin store.")
     async def store(self, ctx: Context):
         if ctx.invoked_subcommand is None:
             await self.store_list(ctx)
@@ -262,7 +284,7 @@ class EconomyCog(commands.Cog, name="Economy"):
             "SELECT * FROM shop_items WHERE guild_id=? ORDER BY price ASC", (ctx.guild.id,)
         )
         if not rows:
-            return await ctx.send(f"{ERROR_EMOJI} The store is empty. An admin can add items with `/store add`.", ephemeral=True)
+            return await ctx.send(f"{ERROR_EMOJI} The store is empty. An admin can add items with `/economy store add`.", ephemeral=True)
 
         lines = []
         for r in rows:
@@ -274,7 +296,7 @@ class EconomyCog(commands.Cog, name="Economy"):
             lines.append(line)
 
         embed = discord.Embed(title="🛒 Store", description="\n".join(lines), color=EMBED_COLOR)
-        embed.set_footer(text="Use /store buy <name> to purchase an item.")
+        embed.set_footer(text="Use /economy store buy <name> to purchase an item.")
         await ctx.send(embed=embed)
 
     @store.command(name="add", description="[Admin] Add a new item to the store.")
@@ -325,7 +347,7 @@ class EconomyCog(commands.Cog, name="Economy"):
 
         role_to_give = ctx.guild.get_role(item['role_id']) if item['role_id'] else None
         if item['role_id'] and not role_to_give:
-            return await ctx.send(f"{ERROR_EMOJI} This item's role no longer exists, ask an admin to fix `/store remove` + `/store add` it.", ephemeral=True)
+            return await ctx.send(f"{ERROR_EMOJI} This item's role no longer exists, ask an admin to fix `/economy store remove` + `/economy store add` it.", ephemeral=True)
 
         await self.add_balance(ctx.guild.id, ctx.author.id, -item['price'])
         await self.db.execute(
@@ -346,23 +368,6 @@ class EconomyCog(commands.Cog, name="Economy"):
     async def store_item_autocomplete(self, interaction: discord.Interaction, current: str):
         items = await self.db.fetchall("SELECT name FROM shop_items WHERE guild_id=?", (interaction.guild.id,))
         return [app_commands.Choice(name=i['name'], value=i['name']) for i in items if current.lower() in i['name'].lower()][:25]
-
-    # --- Inventory ---
-    @commands.hybrid_command(name="inventory", description="See what a member has bought from the store.")
-    @app_commands.describe(member="The member whose inventory you want to check (defaults to you).")
-    @commands.guild_only()
-    async def inventory(self, ctx: Context, member: discord.Member = None):
-        member = member or ctx.author
-        rows = await self.db.fetchall(
-            "SELECT item_name, purchased_at FROM inventory WHERE guild_id=? AND user_id=? ORDER BY purchased_at DESC",
-            (ctx.guild.id, member.id)
-        )
-        if not rows:
-            return await ctx.send(f"{ERROR_EMOJI} {member.mention} hasn't bought anything from the store yet.", ephemeral=True)
-
-        lines = [f"• **{r['item_name']}**" for r in rows]
-        embed = discord.Embed(title=f"🎒 {member.display_name}'s Inventory", description="\n".join(lines), color=EMBED_COLOR)
-        await ctx.send(embed=embed)
 
 
 async def setup(bot):
