@@ -13,7 +13,7 @@ from utils.turso_db import get_client
 
 # --- Configurable Variables ---
 EMBED_COLOR = 0x3498DB
-TICKET_CHANNEL_IMAGE_URL = "https://cdn.discordapp.com/attachments/1530611685772103750/1530611805926199547/Gemini_Generated_Image_opnjhropnjhropnj.png?ex=6a6634d3&is=6a64e353&hm=c6450bb9d72b189368fcf67702aec5120088ccb8581ffc0ac39a131a7f37eba6&"
+TICKET_CHANNEL_IMAGE_URL = "https://media.discordapp.net/attachments/1396590062304755792/1545695732269580378/Gemini_Generated_Image_opnjhropnjhropnj.png?ex=6a9d14d4&is=6a9bc354&hm=4f2818d8903fa085bcbb254babf1b02a157fc2ddde6f0de008528753a5c74d7b&=&format=webp&quality=lossless&width=1280&height=732"
 
 # --- Emoji Variables ---
 SUCCESS_EMOJI = TICK
