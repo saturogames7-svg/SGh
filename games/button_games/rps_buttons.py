@@ -1,17 +1,3 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                                                                  ║
-# ║   ░█▀▀░█▀█░█▀▄░█▀▀░█░█   ░█▀▄░█▀▀░█░█░█▀▀                     ║
-# ║   ░█░░░█░█░█░█░█▀▀░▄▀▄   ░█░█░█▀▀░▀▄▀░▀▀█                     ║
-# ║   ░▀▀▀░▀▀▀░▀▀░░▀▀▀░▀░▀   ░▀▀░░▀▀▀░░▀░░▀▀▀                     ║
-# ║                                                                  ║
-# ║            © 2026 CodeX Devs — All Rights Reserved              ║
-# ║                                                                  ║
-# ║   discord  ──  https://discord.gg/codexdev                      ║
-# ║   youtube  ──  https://youtube.com/@CodeXDevs                   ║
-# ║   github   ──  https://github.com/RayExo                        ║
-# ║                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
 from __future__ import annotations
 
 from typing import Optional
@@ -23,6 +9,9 @@ from discord.ext import commands
 
 from ..rps import RockPaperScissors
 from ..utils import DiscordColor, DEFAULT_COLOR, BaseView
+
+RPS_REWARD_MIN = 10
+RPS_REWARD_MAX = 20
 
 
 class RPSButton(discord.ui.Button["RPSView"]):
@@ -98,6 +87,12 @@ class RPSButton(discord.ui.Button["RPSView"]):
                             f"\n\n{game.player1.mention} chose {game.player1_choice}."
                             f"\n{game.player2.mention} chose {game.player2_choice}."
                         )
+
+                        reward = random.randint(RPS_REWARD_MIN, RPS_REWARD_MAX)
+                        eco = interaction.client.get_cog("Economy")
+                        if eco:
+                            await eco.add_balance(interaction.guild.id, who_won.id, reward)
+                        game.embed.description += f"\n\n{who_won.mention} earned **{reward}** coins 🪙"
 
                     self.view.disable_all()
                     self.view.stop()
@@ -186,3 +181,4 @@ class BetaRockPaperScissors(RockPaperScissors):
 
         await self.view.wait()
         return self.message
+        
