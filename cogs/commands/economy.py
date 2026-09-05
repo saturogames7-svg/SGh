@@ -41,6 +41,21 @@ CRIME_FAIL_MIN, CRIME_FAIL_MAX = 30, 100
 DAILY_COOLDOWN = 24 * 60 * 60    # 24 hours
 DAILY_MIN, DAILY_MAX = 100, 250
 
+# --- Store display: the store message now uses Discord's newer
+# "Components V2" layout (discord.ui.LayoutView / Container / Section)
+# so each item renders as its own row: emoji+name on the left, a button
+# showing just the price on the right that instantly buys it (matches
+# the row-style store layout, e.g. UnbelievaBoat's store card).
+# Requires discord.py >= 2.6 (that's when discord.ui.Section landed).
+#
+# V2 messages cap out at 40 total components INCLUDING nested ones. Each
+# item row costs 3 components (Section + its TextDisplay + its Button
+# accessory), plus ~3 more for the container/header/separator, so we cap
+# the buttoned rows well under that limit. A guild can still stock up to
+# MAX_SHOP_ITEMS_PER_GUILD items - anything beyond the buttoned rows is
+# still purchasable with /economy store buy <name>.
+MAX_STORE_BUTTON_ITEMS = 10
+
 WORK_MESSAGES = [
     "You delivered packages all day and earned",
     "You worked a shift at the coffee shop and made",
@@ -92,17 +107,15 @@ def fmt_cooldown(seconds: int) -> str:
     return " ".join(parts)
 
 
-# --- Store buttons: instant-buy directly from the /economy store list embed.
-# Discord hard-caps components at 25 per message (5 rows x 5 buttons), so if
-# the store has more than 25 items only the first 25 (cheapest, since
-# store_list orders by price ASC) get a button - the rest are still
-# purchasable with /economy store buy <name>. ---
+# --- Store buttons: instant-buy directly from the /economy store list message.
 class StoreBuyButton(discord.ui.Button):
     def __init__(self, item: dict):
-        emoji, label_name = split_item_emoji(item["name"])
+        # Only the price is shown on the button itself now - the item's
+        # name/emoji is shown as the row text next to it (see
+        # StoreItemSection below).
         super().__init__(
-            label=f"{label_name} — {item['price']:,}",
-            emoji=emoji,
+            label=f"{item['price']:,}",
+            emoji=COIN_EMOJI,
             style=discord.ButtonStyle.green,
         )
         self.item_id = item["item_id"]
@@ -158,11 +171,32 @@ class StoreBuyButton(discord.ui.Button):
         )
 
 
-class StoreView(discord.ui.View):
+class StoreItemSection(discord.ui.Section):
+    """One row of the store: the item's emoji+name as text on the left,
+    and its price as a button accessory on the right that instantly buys
+    it when clicked."""
+    def __init__(self, item: dict):
+        emoji, label_name = split_item_emoji(item["name"])
+        super().__init__(
+            discord.ui.TextDisplay(f"{emoji}  **{label_name}**"),
+            accessory=StoreBuyButton(item),
+        )
+
+
+class StoreView(discord.ui.LayoutView):
+    """Components V2 layout for the store message. Replaces the old
+    embed-plus-button-grid with one row per item (name left, price
+    button right)."""
     def __init__(self, items: list[dict]):
         super().__init__(timeout=None)
-        for item in items[:25]:
-            self.add_item(StoreBuyButton(item))
+        container = discord.ui.Container(accent_color=STORE_EMBED_COLOR)
+        container.add_item(discord.ui.TextDisplay(
+            "🛒 **Store**\nClick a button to instantly buy an item, or use `/economy store buy <name>`."
+        ))
+        container.add_item(discord.ui.Separator())
+        for item in items[:MAX_STORE_BUTTON_ITEMS]:
+            container.add_item(StoreItemSection(item))
+        self.add_item(container)
 
 
 # --- Database Class (Turso) ---
@@ -491,19 +525,17 @@ class EconomyCog(commands.Cog, name="Economy"):
         if not rows:
             return await ctx.send(f"{ERROR_EMOJI} The store is empty. An admin can add items with `/economy store add`.", ephemeral=True)
 
-        lines = []
-        for r in rows:
-            emoji, label = split_item_emoji(r['name'])
-            lines.append(f"{emoji}  **{label}**\n{fmt_amount(r['price'])}")
-
-        embed = discord.Embed(
-            title="🛒 Store",
-            description="Click a button below to instantly buy an item, or use `/economy store buy <name>`.\n\n" + "\n\n".join(lines),
-            color=STORE_EMBED_COLOR,
-        )
-
         view = StoreView(rows)
-        await ctx.send(embed=embed, view=view)
+
+        # Always send as a fresh, standalone message - never as a reply to
+        # the invoking message. (mention_author only matters for prefix
+        # invocation; slash-command responses are never shown as replies
+        # in the first place, and passing reply-only kwargs to an
+        # interaction response would error, hence the guard.)
+        send_kwargs = {"view": view}
+        if ctx.interaction is None:
+            send_kwargs["mention_author"] = False
+        await ctx.send(**send_kwargs)
 
     @store.command(name="add", description="[Admin] Add a new item to the store.")
     @app_commands.describe(
