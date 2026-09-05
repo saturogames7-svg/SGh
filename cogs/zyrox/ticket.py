@@ -12,5 +12,4 @@ class _ticket(commands.Cog):
         return emoji, label, description
     @commands.group()
     async def __Ticket__(self, ctx: commands.Context):
-        """`/ticket setup`, `/ticket panels`, `/ticket delete`, `/ticket category add`, `/ticket category remove`, `/ticket color`, `/ticket close`, `/ticket lock`, `/ticket claim`, `/ticket unlock`, `/ticket transcript`, `/ticket add`"""
-        
+        """`/ticket setup`, `/ticket panels`, `/ticket delete`, `/ticket category add`, `/ticket category remove`, `/ticket color`, `/ticket close`, `/ticket lock`, `/ticket claim`, `/ticket unlock`, `/ticket transcript`, `/ticket add`, `/ticket remove`"""
