@@ -31,6 +31,78 @@ def fmt_amount(amount: int) -> str:
     return f"{COIN_EMOJI} {amount:,}"
 
 
+# --- Store buttons: instant-buy directly from the /economy store list embed.
+# Discord hard-caps components at 25 per message (5 rows x 5 buttons), so if
+# the store has more than 25 items only the first 25 (cheapest, since
+# store_list orders by price ASC) get a button - the rest are still
+# purchasable with /economy store buy <name>. ---
+class StoreBuyButton(discord.ui.Button):
+    def __init__(self, item: dict):
+        super().__init__(
+            label=f"{item['name']} — {item['price']:,}",
+            emoji=COIN_EMOJI,
+            style=discord.ButtonStyle.green,
+        )
+        self.item_id = item["item_id"]
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        cog = interaction.client.get_cog("Economy")
+        if not cog:
+            return await interaction.response.send_message(
+                f"{ERROR_EMOJI} Store is unavailable right now.", ephemeral=True
+            )
+
+        # re-fetch fresh from db - the item may have been removed/changed
+        # since this button was rendered
+        item = await cog.db.fetchone("SELECT * FROM shop_items WHERE item_id=?", (self.item_id,))
+        if not item:
+            return await interaction.response.send_message(
+                f"{ERROR_EMOJI} This item no longer exists.", ephemeral=True
+            )
+
+        balance = await cog.get_balance(interaction.guild.id, interaction.user.id)
+        if balance < item["price"]:
+            return await interaction.response.send_message(
+                f"{ERROR_EMOJI} You need {fmt_amount(item['price'])} but only have {fmt_amount(balance)}.",
+                ephemeral=True,
+            )
+
+        role_to_give = interaction.guild.get_role(item["role_id"]) if item["role_id"] else None
+        if item["role_id"] and not role_to_give:
+            return await interaction.response.send_message(
+                f"{ERROR_EMOJI} This item's role no longer exists, ask an admin to fix `/economy store remove` + `/economy store add` it.",
+                ephemeral=True,
+            )
+
+        await cog.add_balance(interaction.guild.id, interaction.user.id, -item["price"])
+        await cog.db.execute(
+            "INSERT INTO inventory (guild_id, user_id, item_id, item_name, purchased_at) VALUES (?,?,?,?,?)",
+            (interaction.guild.id, interaction.user.id, item["item_id"], item["name"], datetime.now().isoformat()),
+        )
+
+        if role_to_give:
+            try:
+                await interaction.user.add_roles(role_to_give, reason=f"Purchased '{item['name']}' from the store")
+            except Exception:
+                return await interaction.response.send_message(
+                    f"{SUCCESS_EMOJI} Bought **{item['name']}**, but I couldn't assign {role_to_give.mention} (check my role position/permissions).",
+                    ephemeral=True,
+                )
+
+        await interaction.response.send_message(
+            f"{SUCCESS_EMOJI} You bought **{item['name']}** for {fmt_amount(item['price'])}!"
+            + (f" You received {role_to_give.mention}." if role_to_give else ""),
+            ephemeral=True,
+        )
+
+
+class StoreView(discord.ui.View):
+    def __init__(self, items: list[dict]):
+        super().__init__(timeout=None)
+        for item in items[:25]:
+            self.add_item(StoreBuyButton(item))
+
+
 # --- Database Class (Turso) ---
 class EconomyDatabase:
     # Single source of truth for expected columns/types per table.
@@ -287,11 +359,16 @@ class EconomyCog(commands.Cog, name="Economy"):
         if not rows:
             return await ctx.send(f"{ERROR_EMOJI} The store is empty. An admin can add items with `/economy store add`.", ephemeral=True)
 
-        lines = [f"**{r['name']}** — {fmt_amount(r['price'])}" for r in rows]
+        embed = discord.Embed(
+            title="🛒 Store",
+            description="Click a button below to instantly buy an item, or use `/economy store buy <name>`.",
+            color=STORE_EMBED_COLOR,
+        )
+        for r in rows:
+            embed.add_field(name=r['name'], value=fmt_amount(r['price']), inline=True)
 
-        embed = discord.Embed(title="🛒 Store", description="\n".join(lines), color=STORE_EMBED_COLOR)
-        embed.set_footer(text="Use /economy store buy <name> to purchase an item.")
-        await ctx.send(embed=embed)
+        view = StoreView(rows)
+        await ctx.send(embed=embed, view=view)
 
     @store.command(name="add", description="[Admin] Add a new item to the store.")
     @app_commands.describe(
