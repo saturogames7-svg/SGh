@@ -958,6 +958,23 @@ class TicketCog(commands.Cog, name="Ticket System"):
         await ctx.send(f"{SUCCESS_EMOJI} {member.mention} has been added to this ticket by {ctx.author.mention}.")
         await log_ticket_action(self.db, ctx.guild, ctx.author, "Member Added", f"{member.mention} added to {ctx.channel.mention} by {ctx.author.mention}.")
 
+    @ticket.command(name="remove", description="Remove a member you previously added from this ticket channel.")
+    @commands.has_permissions(manage_channels=True)
+    @app_commands.describe(member="The member you want to remove from this ticket.")
+    async def remove_member(self, ctx, member: discord.Member):
+        ephemeral = True if ctx.interaction else False
+        t = await self.db.fetchone("SELECT * FROM open_tickets WHERE channel_id=?", (ctx.channel.id,))
+        if not t:
+            return await ctx.send(f"{ERROR_EMOJI} This isn't a ticket channel.", ephemeral=ephemeral)
+        if t['closed_at']:
+            return await ctx.send(f"{ERROR_EMOJI} This ticket is closed, you can't remove members from a closed ticket.", ephemeral=ephemeral)
+        if member.id == t['creator_id']:
+            return await ctx.send(f"{ERROR_EMOJI} You can't remove the ticket creator, use `/ticket close` instead.", ephemeral=ephemeral)
+
+        await ctx.channel.set_permissions(member, overwrite=None)
+        await ctx.send(f"{SUCCESS_EMOJI} {member.mention} has been removed from this ticket by {ctx.author.mention}.")
+        await log_ticket_action(self.db, ctx.guild, ctx.author, "Member Removed", f"{member.mention} removed from {ctx.channel.mention} by {ctx.author.mention}.")
+
     @ticket.command(name="transcript", description="Generate a transcript of a closed ticket.")
     @commands.has_permissions(manage_channels=True)
     async def transcript(self, ctx):
@@ -1141,5 +1158,6 @@ async def setup(bot):
         traceback.print_exc()
         print("=" * 60)
         raise
+        
 
 
