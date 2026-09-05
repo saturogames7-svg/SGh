@@ -1,4 +1,7 @@
 import discord
+import re
+import time
+import random
 from utils.emoji import CROSS, TICK, MONEY, HANDSHAKE
 from discord import app_commands
 from discord.ext import commands
@@ -25,10 +28,68 @@ PAY_EMOJI = HANDSHAKE
 MAX_SHOP_ITEMS_PER_GUILD = 50
 LEADERBOARD_PAGE_SIZE = 10
 
+# --- Income command balancing: kept deliberately modest with long
+# cooldowns so members can't stack up coins too easily. ---
+WORK_COOLDOWN = 60 * 60          # 1 hour
+WORK_MIN, WORK_MAX = 20, 60
+
+CRIME_COOLDOWN = 2 * 60 * 60     # 2 hours
+CRIME_SUCCESS_CHANCE = 0.5
+CRIME_SUCCESS_MIN, CRIME_SUCCESS_MAX = 50, 150
+CRIME_FAIL_MIN, CRIME_FAIL_MAX = 30, 100
+
+DAILY_COOLDOWN = 24 * 60 * 60    # 24 hours
+DAILY_MIN, DAILY_MAX = 100, 250
+
+WORK_MESSAGES = [
+    "You delivered packages all day and earned",
+    "You worked a shift at the coffee shop and made",
+    "You helped fix a neighbor's fence and got paid",
+    "You walked some dogs around the block and earned",
+    "You tutored a kid in math and were paid",
+]
+
+CRIME_SUCCESS_MESSAGES = [
+    "You pickpocketed a stranger and got away with",
+    "You snuck into a warehouse and sold some goods for",
+    "You ran a small scam and made off with",
+]
+
+CRIME_FAIL_MESSAGES = [
+    "You got caught trying to shoplift and paid a fine of",
+    "The cops caught you red-handed, costing you",
+    "Your scheme fell apart and you had to pay",
+]
+
 
 def fmt_amount(amount: int) -> str:
     """Format an integer amount with the coin emoji and thousands separators."""
     return f"{COIN_EMOJI} {amount:,}"
+
+
+def split_item_emoji(name: str) -> tuple[str, str]:
+    """Splits a leading emoji (custom or unicode) off an item name.
+    e.g. '💥 player addicted role' -> ('💥', 'player addicted role')
+    Falls back to (COIN_EMOJI, name) if there's no leading emoji."""
+    match = re.match(r"^(\S+)\s+(.+)$", name)
+    if match and not match.group(1).isalnum():
+        return match.group(1), match.group(2)
+    return COIN_EMOJI, name
+
+
+def fmt_cooldown(seconds: int) -> str:
+    """Formats a remaining-cooldown duration as e.g. '1h 12m 4s'."""
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    if s or not parts:
+        parts.append(f"{s}s")
+    return " ".join(parts)
 
 
 # --- Store buttons: instant-buy directly from the /economy store list embed.
@@ -38,9 +99,10 @@ def fmt_amount(amount: int) -> str:
 # purchasable with /economy store buy <name>. ---
 class StoreBuyButton(discord.ui.Button):
     def __init__(self, item: dict):
+        emoji, label_name = split_item_emoji(item["name"])
         super().__init__(
-            label=f"{item['name']} — {item['price']:,}",
-            emoji=COIN_EMOJI,
+            label=f"{label_name} — {item['price']:,}",
+            emoji=emoji,
             style=discord.ButtonStyle.green,
         )
         self.item_id = item["item_id"]
@@ -127,10 +189,15 @@ class EconomyDatabase:
     # wallets uses a composite PK (guild_id, user_id) so it's handled like
     # user_ticket_counts in ticket.py - a raw CREATE TABLE, with _migrate()
     # still able to add future columns since it only inspects columns.
+    # last_work/last_crime/last_daily store unix timestamps (seconds) of
+    # the last time each income command was used, for cooldown checks.
     WALLETS_SCHEMA = {
         "guild_id": "INTEGER",
         "user_id": "INTEGER",
         "balance": "INTEGER DEFAULT 0",
+        "last_work": "INTEGER DEFAULT 0",
+        "last_crime": "INTEGER DEFAULT 0",
+        "last_daily": "INTEGER DEFAULT 0",
     }
 
     def __init__(self):
@@ -242,6 +309,23 @@ class EconomyCog(commands.Cog, name="Economy"):
             "SELECT * FROM shop_items WHERE guild_id=? AND LOWER(name)=LOWER(?)", (guild_id, name)
         )
 
+    async def get_cooldown_remaining(self, guild_id: int, user_id: int, column: str, cooldown_seconds: int) -> int:
+        """Returns seconds remaining before `column` (last_work/last_crime/last_daily)
+        is off cooldown for this member. 0 or negative means ready to use."""
+        row = await self.db.fetchone(
+            f"SELECT {column} FROM wallets WHERE guild_id=? AND user_id=?", (guild_id, user_id)
+        )
+        last_used = row[column] if row and row[column] else 0
+        elapsed = time.time() - last_used
+        return int(cooldown_seconds - elapsed)
+
+    async def set_cooldown(self, guild_id: int, user_id: int, column: str):
+        await self.db.execute(
+            f"INSERT INTO wallets (guild_id, user_id, {column}) VALUES (?,?,?) "
+            f"ON CONFLICT(guild_id,user_id) DO UPDATE SET {column}=excluded.{column}",
+            (guild_id, user_id, int(time.time()))
+        )
+
     # --- Root group: everything lives under /economy so the whole feature
     # only costs ONE global slash-command slot (Discord caps a bot at 100
     # top-level application commands; a group with subcommands still only
@@ -251,6 +335,54 @@ class EconomyCog(commands.Cog, name="Economy"):
     async def economy(self, ctx: Context):
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
+
+    # --- Income commands ---
+    @economy.command(name="work", description="Work a shift for some guaranteed coins.")
+    async def work(self, ctx: Context):
+        remaining = await self.get_cooldown_remaining(ctx.guild.id, ctx.author.id, "last_work", WORK_COOLDOWN)
+        if remaining > 0:
+            return await ctx.send(f"{ERROR_EMOJI} You're tired! Try working again in **{fmt_cooldown(remaining)}**.", ephemeral=True)
+
+        amount = random.randint(WORK_MIN, WORK_MAX)
+        message = random.choice(WORK_MESSAGES)
+
+        await self.add_balance(ctx.guild.id, ctx.author.id, amount)
+        await self.set_cooldown(ctx.guild.id, ctx.author.id, "last_work")
+
+        await ctx.send(f"💼 {message} {fmt_amount(amount)}!")
+
+    @economy.command(name="crime", description="Attempt a crime for a bigger payout, but risk a fine if caught.")
+    async def crime(self, ctx: Context):
+        remaining = await self.get_cooldown_remaining(ctx.guild.id, ctx.author.id, "last_crime", CRIME_COOLDOWN)
+        if remaining > 0:
+            return await ctx.send(f"{ERROR_EMOJI} Lay low for a while! Try again in **{fmt_cooldown(remaining)}**.", ephemeral=True)
+
+        await self.set_cooldown(ctx.guild.id, ctx.author.id, "last_crime")
+
+        if random.random() < CRIME_SUCCESS_CHANCE:
+            amount = random.randint(CRIME_SUCCESS_MIN, CRIME_SUCCESS_MAX)
+            message = random.choice(CRIME_SUCCESS_MESSAGES)
+            await self.add_balance(ctx.guild.id, ctx.author.id, amount)
+            await ctx.send(f"🕵️ {message} {fmt_amount(amount)}!")
+        else:
+            balance = await self.get_balance(ctx.guild.id, ctx.author.id)
+            fine = min(random.randint(CRIME_FAIL_MIN, CRIME_FAIL_MAX), balance)
+            message = random.choice(CRIME_FAIL_MESSAGES)
+            await self.add_balance(ctx.guild.id, ctx.author.id, -fine)
+            await ctx.send(f"🚨 {message} {fmt_amount(fine)}.")
+
+    @economy.command(name="daily", description="Claim your daily coin reward.")
+    async def daily(self, ctx: Context):
+        remaining = await self.get_cooldown_remaining(ctx.guild.id, ctx.author.id, "last_daily", DAILY_COOLDOWN)
+        if remaining > 0:
+            return await ctx.send(f"{ERROR_EMOJI} You've already claimed today's reward. Come back in **{fmt_cooldown(remaining)}**.", ephemeral=True)
+
+        amount = random.randint(DAILY_MIN, DAILY_MAX)
+
+        await self.add_balance(ctx.guild.id, ctx.author.id, amount)
+        await self.set_cooldown(ctx.guild.id, ctx.author.id, "last_daily")
+
+        await ctx.send(f"🎁 You claimed your daily reward of {fmt_amount(amount)}!")
 
     # --- Wallet / Balance ---
     @economy.command(name="balance", aliases=["bal", "wallet"], description="Check your or another member's coin balance.")
@@ -359,13 +491,16 @@ class EconomyCog(commands.Cog, name="Economy"):
         if not rows:
             return await ctx.send(f"{ERROR_EMOJI} The store is empty. An admin can add items with `/economy store add`.", ephemeral=True)
 
+        lines = []
+        for r in rows:
+            emoji, label = split_item_emoji(r['name'])
+            lines.append(f"{emoji}  **{label}**\n{fmt_amount(r['price'])}")
+
         embed = discord.Embed(
             title="🛒 Store",
-            description="Click a button below to instantly buy an item, or use `/economy store buy <name>`.",
+            description="Click a button below to instantly buy an item, or use `/economy store buy <name>`.\n\n" + "\n\n".join(lines),
             color=STORE_EMBED_COLOR,
         )
-        for r in rows:
-            embed.add_field(name=r['name'], value=fmt_amount(r['price']), inline=True)
 
         view = StoreView(rows)
         await ctx.send(embed=embed, view=view)
