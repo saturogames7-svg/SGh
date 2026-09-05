@@ -1,17 +1,3 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                                                                  ║
-# ║   ░█▀▀░█▀█░█▀▄░█▀▀░█░█   ░█▀▄░█▀▀░█░█░█▀▀                     ║
-# ║   ░█░░░█░█░█░█░█▀▀░▄▀▄   ░█░█░█▀▀░▀▄▀░▀▀█                     ║
-# ║   ░▀▀▀░▀▀▀░▀▀░░▀▀▀░▀░▀   ░▀▀░░▀▀▀░░▀░░▀▀▀                     ║
-# ║                                                                  ║
-# ║            © 2026 CodeX Devs — All Rights Reserved              ║
-# ║                                                                  ║
-# ║   discord  ──  https://discord.gg/codexdev                      ║
-# ║   youtube  ──  https://youtube.com/@CodeXDevs                   ║
-# ║   github   ──  https://github.com/RayExo                        ║
-# ║                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
 import discord
 from discord.ext import commands
 import os
@@ -92,6 +78,19 @@ class Games(Cog):
     async def _wordle(self, ctx: Context):
         game = games.Wordle()
         await game.start(ctx, timeout=120)
+
+    @commands.hybrid_command(name="typeracer",
+                             help="Type the sentence as fast and accurately as you can to win coins!",
+                             aliases=["tr", "typerace"],
+                             usage="typeracer")
+    @blacklist_check()
+    @ignore_check()
+    @commands.cooldown(1, 3, commands.BucketType.user)
+    @commands.max_concurrency(3, per=commands.BucketType.default, wait=False)
+    @commands.guild_only()
+    async def _typeracer(self, ctx: Context):
+        game = games.TypeRacer()
+        await game.start(ctx, timeout=40)
 
     @commands.hybrid_command(name="2048",
                              help="Play 2048 game with bot.",
@@ -197,3 +196,4 @@ class Games(Cog):
     async def _lights_show(self, ctx: Context):
         game = btn.LightsOut()
         await game.start(ctx)
+        
