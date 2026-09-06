@@ -67,7 +67,7 @@ class Games(Cog):
             game = btn.BetaTictactoe(cross=ctx.author, circle=player)
             await game.start(ctx, timeout=30)
 
-    @commands.hybrid_command(name="wordle",
+    @commands.hybrid_command(name="economy-wordle",
                              help="Wordle Game | Play with bot.",
                              usage="Wordle")
     @blacklist_check()
@@ -193,6 +193,10 @@ class Games(Cog):
     @commands.cooldown(1, 3, commands.BucketType.user)
     @commands.max_concurrency(3, per=commands.BucketType.default, wait=False)
     @commands.guild_only()
+    async def _lights_show(self, ctx: Context):
+        game = btn.LightsOut()
+        await game.start(ctx)
+        
     async def _lights_show(self, ctx: Context):
         game = btn.LightsOut()
         await game.start(ctx)
